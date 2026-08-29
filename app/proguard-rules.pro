@@ -1,0 +1,2 @@
+-keep class com.moyu.LiquidGlass.** { *; }
+-keep class com.example.liquidglass.** { *; }
