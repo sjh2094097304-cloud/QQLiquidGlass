@@ -70,19 +70,50 @@ public final class BubbleXposedInit implements IXposedHookLoadPackage, IXposedHo
         ModuleIcon.setModuleApkPath(modulePath);
     }
 
-    @Override
-    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!QQ_PACKAGE.equals(lpparam.packageName)) return;
-        // Isolated loaders can rename the primary process. Still skip QQ's known subprocesses.
-        if (lpparam.processName != null && lpparam.processName.startsWith(QQ_PACKAGE + ":")) return;
-        try {
-            XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook(100) {
-                @Override protected void afterHookedMethod(MethodHookParam param) {
-                    Context context = param.thisObject instanceof Context ? (Context) param.thisObject : (Context) param.args[0];
-                    initialize(context, lpparam.classLoader);
+@Override
+public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+    if (!QQ_PACKAGE.equals(lpparam.packageName)) {
+        return;
+    }
+
+    // Isolated loaders can rename the primary process.
+    // Still skip QQ's known subprocesses.
+    if (lpparam.processName != null
+            && lpparam.processName.startsWith(QQ_PACKAGE + ":")) {
+        return;
+    }
+
+    try {
+        XposedHelpers.findAndHookMethod(
+                Application.class,
+                "attach",
+                Context.class,
+                new XC_MethodHook(100) {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        Context context;
+
+                        if (param.thisObject instanceof Context) {
+                            context = (Context) param.thisObject;
+                        } else if (param.args != null
+                                && param.args.length > 0
+                                && param.args[0] instanceof Context) {
+                            context = (Context) param.args[0];
+                        } else {
+                            return;
+                        }
+
+                        initialize(context, lpparam.classLoader);
+                    }
                 }
-            });
-        } catch (Throwable error) { HookLog.info("Application.attach 挂载失败：" + error.getClass().getSimpleName()); }
+        );
+    } catch (Throwable error) {
+        HookLog.info(
+                "Application.attach 挂载失败："
+                        + error.getClass().getSimpleName()
+        );
+    }
+}
 
     private static synchronized void initialize(Context context, ClassLoader fallbackLoader) {
         if (initialized || context == null) return;
