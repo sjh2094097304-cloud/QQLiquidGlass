@@ -1,36 +1,20 @@
-# QQ液态模块
+# 百变气泡 3.7 修复源码
 
-- 包名：`com.moyu.LiquidGlass`
-- 版本：`0.0.1.beta1`
-- 作用域：`com.tencent.mobileqq`
-- 适配：QQ 9.2.75
-- 作者：陌语
-- 液态玻璃库：QWEA0/Liquid-Glass-Android
+基于上传的 3.6 源码修复。作者与原移植说明、头像和界面样式保留；应用及 QQ 内设置新增 3.7 修复日志。
 
-模块说明：
+**当前交付为源码，尚未生成或验证 3.7 APK。** 本次环境没有 Android SDK/Gradle 构建缓存，工具下载请求受审批策略限制。已完成可离线运行的逻辑回归、Java 接口桩编译和原发布证书核对。QQ/Android/FPA 真机行为仍需构建后验收。
 
-> 该模块由陌语制作，适配QQ9.2.75的底栏液态玻璃
+- [更新日志](RELEASE_NOTES.md)
+- [构建及签名](BUILDING.md)
+- [修复与验证记录](VERIFICATION.md)
+- [回归测试说明](tests/README.md)
 
-## GitHub Actions
+有 Android SDK 的环境可以直接使用原压缩包中的签名：
 
-推送到 `main` 或手动运行 `Build QQ Liquid Glass` 即可编译 Release APK。
+```bash
+python3 tools/build_release.py --archive /完整路径/气泡3.6源码.zip --sdk /完整路径/Android/Sdk
+```
 
-APK：
+成功后产出 `build/deliverables/bubble-3.7.apk`，脚本会核对包名、版本和原签名证书。源码中已准备 GitHub Actions 工作流；本次没有可写仓库授权，未发布到 GitHub，也未运行云端构建。
 
-`app/build/outputs/apk/release/app-release.apk`
-
-## Liquid Glass
-
-本项目使用 QWEA0 的 Android View 液态玻璃库。该库支持 API 24+，API 33+ 使用 AGSL 液态玻璃管线。
-
-官方仓库：
-https://github.com/QWEA0/Liquid-Glass-Android
-
-当前依赖：
-`com.github.QWEA0:liquidglass:v2.0.5`
-
-## Beta 说明
-
-QQ 9.2.75 的 BottomBar 和设置页面存在版本/混淆差异。当前 Beta1 使用结构特征扫描定位底栏，并在设置 Activity 上记录候选类名。第一次实机运行后，应根据 LSPosed 日志把定位器收紧为 QQ 9.2.75 专用实现。
-
-本项目只进行 UI 渲染修改，不绕过 QQ 的账号、安全、加密或认证机制。
+适用传统 Xposed API 的框架；QQ 最低声明版本保留 9.2.75。增加了免 root 隔离环境的本地配置、延迟注入及错误降级逻辑，但不宣称“所有框架/所有后续 QQ 版本均已验证”。

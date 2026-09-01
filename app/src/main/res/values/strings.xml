@@ -1,6 +1,0 @@
-<resources>
-    <string name="app_name">QQ液态模块</string>
-    <string name="app_description">该模块由陌语制作，适配QQ9.2.75的底栏液态玻璃</string>
-    <string name="xposed_description">该模块由陌语制作，适配QQ9.2.75的底栏液态玻璃。使用 QWEA0/Liquid-Glass-Android。</string>
-    <string name="settings_title">QQ液态模块</string>
-</resources>

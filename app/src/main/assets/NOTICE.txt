@@ -1,0 +1,13 @@
+百变气泡
+
+QQNT 消息菜单与设置入口的兼容思路参考 QAuxiliary：
+https://github.com/cinit/QAuxiliary
+
+QAuxiliary is licensed under the GNU Affero General Public License v3.0.
+
+本模块的 QQNT 菜单、资源加载、防撤回与 Liquid Glass 界面实现，
+基于 QFun 的公开源码进行集成与适配修改：
+https://github.com/oneQAQone/QFun
+
+QFun is licensed under the GNU General Public License v3.0.
+Xposed API is provided by the Xposed project.

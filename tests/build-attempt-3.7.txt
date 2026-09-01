@@ -1,0 +1,2 @@
+原发布证书核对通过（SHA-256）：d09188089fdf640a439181df1541a6af2276985125d18ba6db7a00892c60dc09
+构建未完成：未找到 Android SDK；需要 platform android-35 和 build-tools 35.0.0

@@ -1,7 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.QQLiquidGlass" parent="Theme.AppCompat.DayNight.NoActionBar">
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:windowLightStatusBar">false</item>
-        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:statusBarColor">#FFF6FA</item>
+        <item name="android:navigationBarColor">#FFF6FA</item>
+        <item name="android:colorAccent">#F25D9C</item>
+        <item name="android:windowActionModeOverlay">true</item>
     </style>
 </resources>

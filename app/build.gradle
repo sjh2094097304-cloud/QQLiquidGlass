@@ -1,0 +1,65 @@
+plugins {
+    id 'com.android.application'
+}
+
+def releaseKeyPath = System.getenv('BB_KEYSTORE')
+def releaseStorePassword = System.getenv('BB_STORE_PASSWORD')
+def releaseKeyAlias = System.getenv('BB_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('BB_KEY_PASSWORD')
+def hasReleaseKey = releaseKeyPath && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
+android {
+    namespace 'com.qiutian.bianpaobubble'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        // Keep the installed package and provider authority to preserve 3.6 user data.
+        applicationId 'com.qiutian.bianpaobubble.v36'
+        minSdk 23
+        targetSdk 35
+        // The uploaded 3.6 APK was versionCode 27 (the old source incorrectly said 26).
+        versionCode 28
+        versionName '3.7'
+    }
+
+    signingConfigs {
+        release {
+            if (hasReleaseKey) {
+                storeFile rootProject.file(releaseKeyPath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                storeType 'PKCS12'
+                enableV1Signing true
+                enableV2Signing true
+                enableV3Signing true
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (hasReleaseKey) signingConfig signingConfigs.release
+            minifyEnabled true
+            // Hook/resource references are indirect; do not remove the module avatar.
+            shrinkResources false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/NOTICE.md', 'META-INF/LICENSE.md', 'META-INF/versions/9/OSGI-INF/MANIFEST.MF']
+        }
+    }
+}
+
+dependencies {
+    compileOnly 'de.robv.android.xposed:api:82'
+}

@@ -1,0 +1,15 @@
+OK protobuf: mixed batches, ordinary fields, self routing, malformed packet bounds
+OK import: real Android JSON implementation, malformed data, limits, escapes, omitted fields
+OK random: hash-collision regression and 120 shuffled rounds
+OK message filter: default, emoji, stickers, quoted and forwarded IDs
+OK mall filter: prefixes, boundaries, URL encoding, conflicting products
+OK menu identity and bounded duplicate logging
+OK storage: delete-fixed, commit rollback, actual health probe, caller authorization
+OK provider recovery: durable local replay, retries, restart, partial imports
+OK 3.6 migration and unchanged-snapshot write suppression
+OK cache age and defensive snapshot copies
+OK read failures and staged-write rollback
+OK concurrency: slow IPC, nonblocking send reads, stale response rejection
+OK diagnostics: per-feature evidence
+PASS: 1191 checks; production Java logic executed on JDK 17.
+LIMIT: Android/Binder/QQ devices and APK packaging are not exercised by this suite.

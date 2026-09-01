@@ -1,0 +1,3780 @@
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -2,27 +2,47 @@
+     id 'com.android.application'
+ }
+ 
++def releaseKeyPath = System.getenv('BB_KEYSTORE')
++def releaseStorePassword = System.getenv('BB_STORE_PASSWORD')
++def releaseKeyAlias = System.getenv('BB_KEY_ALIAS')
++def releaseKeyPassword = System.getenv('BB_KEY_PASSWORD')
++def hasReleaseKey = releaseKeyPath && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
++
+ android {
+     namespace 'com.qiutian.bianpaobubble'
+     compileSdk 35
++    buildToolsVersion '35.0.0'
+ 
+     defaultConfig {
+-        // Independent repaired package avoids signature/update conflicts with the
+-        // unrecoverable legacy signing key while preserving the module code.
++        // Keep the installed package and provider authority to preserve 3.6 user data.
+         applicationId 'com.qiutian.bianpaobubble.v36'
+         minSdk 23
+         targetSdk 35
+-        // Keep the public release name at 3.6, but increment the Android package
+-        // revision so every framework/device treats this repaired APK as newer.
+-        versionCode 26
+-        versionName '3.6'
++        // The uploaded 3.6 APK was versionCode 27 (the old source incorrectly said 26).
++        versionCode 28
++        versionName '3.7'
++    }
++
++    signingConfigs {
++        release {
++            if (hasReleaseKey) {
++                storeFile rootProject.file(releaseKeyPath)
++                storePassword releaseStorePassword
++                keyAlias releaseKeyAlias
++                keyPassword releaseKeyPassword
++                storeType 'PKCS12'
++                enableV1Signing true
++                enableV2Signing true
++                enableV3Signing true
++            }
++        }
+     }
+ 
+     buildTypes {
+         release {
++            if (hasReleaseKey) signingConfig signingConfigs.release
+             minifyEnabled true
+-            // Xposed/FPA reaches several resources and classes indirectly. Resource
+-            // shrinking cannot see those references and broke the previous v3.6 APK.
++            // Hook/resource references are indirect; do not remove the module avatar.
+             shrinkResources false
+             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+         }
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -1,6 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+-    package="com.qiutian.bianpaobubble.v36">
++<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+ 
+     <queries>
+         <package android:name="com.tencent.mobileqq" />
+@@ -15,7 +14,7 @@
+         android:theme="@style/AppTheme">
+ 
+         <meta-data android:name="xposedmodule" android:value="true" />
+-        <meta-data android:name="xposeddescription" android:value="百变气泡 3.6｜基于疑是天上星的气泡脚本，由秋天移植为模块" />
++        <meta-data android:name="xposeddescription" android:value="百变气泡 3.7｜基于疑是天上星的气泡脚本，由秋天移植为模块" />
+         <meta-data android:name="xposedminversion" android:value="82" />
+ 
+         <activity
+--- a/app/src/main/java/com/qiutian/bianpaobubble/AppConfig.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/AppConfig.java
+@@ -12,16 +12,48 @@
+ import java.util.Set;
+ 
+ public final class AppConfig {
++    public static final int MAX_IDS = 300;
+     public static final String PREFS = "bubble_config";
+     public static final String AUTHORITY = "com.qiutian.bianpaobubble.v36.config";
+     public static final String MIN_QQ_VERSION = "9.2.75";
+     public static final String AUTHOR_QQ = "3694476602";
+     public static final String GROUP_QQ = "853250567";
+-    /** Versioned keys deliberately show the 3.6 notice once after upgrade. */
++    /** Retained to preserve already accepted notices across the 3.7 upgrade. */
+     public static final String EXTERNAL_NOTICE_V135 = "externalNoticeAcceptedV36Final1";
+     public static final String QQ_NOTICE_V135 = "qqNoticeAcceptedV36Final1";
+ 
+     private AppConfig() {}
++
++    public static boolean validId(int id) { return id >= 1000; }
++
++    public static int[] cleanPool(int[] source) {
++        Set<Integer> ids = new LinkedHashSet<>();
++        if (source != null) for (int id : source) {
++            if (validId(id)) ids.add(id);
++            if (ids.size() > MAX_IDS) throw new IllegalArgumentException("气泡 ID 不能超过 " + MAX_IDS + " 个");
++        }
++        int[] result = new int[ids.size()];
++        int i = 0;
++        for (int id : ids) result[i++] = id;
++        return result;
++    }
++
++    /** One normalization rule for the UI, provider and isolated host process. */
++    public static Bundle normalize(Bundle source) {
++        Bundle result = new Bundle(source);
++        int[] pool = cleanPool(source.getIntArray("pool"));
++        int id = source.getInt("lockedId", 0);
++        if (!validId(id)) id = 0;
++        boolean master = source.getBoolean("masterEnabled", false);
++        boolean locked = master && source.getBoolean("lockedEnabled", false) && id > 0;
++        boolean random = master && !locked && source.getBoolean("randomEnabled", false) && pool.length > 0;
++        result.putIntArray("pool", pool);
++        result.putInt("lockedId", id);
++        result.putBoolean("lockedEnabled", locked);
++        result.putBoolean("randomEnabled", random);
++        result.putBoolean("masterEnabled", locked || random);
++        return result;
++    }
+ 
+     public static SharedPreferences prefs(Context context) {
+         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+@@ -34,14 +66,14 @@
+             JSONArray array = new JSONArray(raw);
+             for (int i = 0; i < array.length(); i++) {
+                 int id = array.optInt(i, 0);
+-                if (id > 0) unique.add(id);
++                if (validId(id) && unique.size() < MAX_IDS) unique.add(id);
+             }
+         } catch (Throwable ignored) {
+             String[] values = raw == null ? new String[0] : raw.split("[^0-9]+");
+             for (String value : values) {
+                 try {
+                     int id = Integer.parseInt(value);
+-                    if (id > 0) unique.add(id);
++                    if (validId(id) && unique.size() < MAX_IDS) unique.add(id);
+                 } catch (Throwable ignoredAgain) {
+                 }
+             }
+@@ -56,7 +88,7 @@
+     public static String poolJson(List<Integer> ids) {
+         JSONArray array = new JSONArray();
+         Set<Integer> unique = new LinkedHashSet<>(ids == null ? new ArrayList<>() : ids);
+-        for (Integer id : unique) if (id != null && id > 0) array.put(id);
++        for (Integer id : unique) if (id != null && validId(id)) array.put(id);
+         return array.toString();
+     }
+ 
+@@ -77,7 +109,10 @@
+         result.putString("lastHookVersion", prefs.getString("lastHookVersion", ""));
+         result.putString("detectedFpaVersion", prefs.getString("detectedFpaVersion", ""));
+         result.putString("log", prefs.getString("log", ""));
+-        return result;
++        result.putLong("settingsRevision", prefs.getLong("settingsRevision", 0L));
++        result.putBoolean("_pendingSync", prefs.getBoolean("_pendingSync", false));
++        result.putBoolean("_ok", true);
++        return normalize(result);
+     }
+ 
+     public static int compareVersion(String left, String right) {
+--- a/app/src/main/java/com/qiutian/bianpaobubble/ConfigProvider.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/ConfigProvider.java
+@@ -1,170 +1,32 @@
+ package com.qiutian.bianpaobubble;
+ 
+-import android.app.ActivityManager;
+ import android.content.ContentProvider;
+-import android.content.Context;
+ import android.content.ContentValues;
+-import android.content.SharedPreferences;
+ import android.database.Cursor;
+ import android.net.Uri;
+ import android.os.Binder;
+ import android.os.Bundle;
+ 
+-import java.text.SimpleDateFormat;
+-import java.util.ArrayList;
+-import java.util.Date;
+-import java.util.List;
+-import java.util.Locale;
++/** IPC facade; storage rules are shared with the isolated-host fallback. */
++public final class ConfigProvider extends ContentProvider {
++    @Override public boolean onCreate() { return true; }
+ 
+-public final class ConfigProvider extends ContentProvider {
+-    @Override
+-    public boolean onCreate() {
+-        return true;
+-    }
+-
+-    @Override
+-    public Bundle call(String method, String arg, Bundle extras) {
+-        if (!isSupportedMethod(method)) return Bundle.EMPTY;
++    @Override public Bundle call(String method, String arg, Bundle extras) {
+         if (!isAllowedCaller()) {
+             Bundle denied = new Bundle();
++            denied.putBoolean("_ok", false);
+             denied.putBoolean("_authDenied", true);
+             denied.putInt("_callingUid", Binder.getCallingUid());
+-            denied.putString("_callerPackages", callerPackages(Binder.getCallingUid()));
+             return denied;
+         }
+-        SharedPreferences prefs = AppConfig.prefs(getContext());
+-        if ("getConfig".equals(method)) {
+-            return AppConfig.toBundle(prefs);
+-        }
++        Bundle result = ConfigStore.call(AppConfig.prefs(getContext()), method, extras, false);
++        result.putString("_configChannel", "模块 Provider");
+         if ("healthCheck".equals(method)) {
+-            long token = extras == null ? System.nanoTime() : extras.getLong("token", System.nanoTime());
+-            boolean committed = prefs.edit().putLong("lastHealthCheckToken", token).commit();
+-            Bundle result = AppConfig.toBundle(prefs);
+-            result.putBoolean("_healthOk", committed
+-                    && prefs.getLong("lastHealthCheckToken", Long.MIN_VALUE) == token);
+             result.putBoolean("_callerAuthorized", true);
+             result.putInt("_callingUid", Binder.getCallingUid());
+-            result.putString("_callerPackages", callerPackages(Binder.getCallingUid()));
+-            result.putString("_providerPackage", getContext() == null ? "" : getContext().getPackageName());
+-            return result;
++            result.putString("_providerPackage", getContext().getPackageName());
+         }
+-        if ("reportHook".equals(method)) {
+-            prefs.edit()
+-                    .putLong("lastHookPing", System.currentTimeMillis())
+-                    .putString("lastHookVersion", extras == null ? "" : extras.getString("version", ""))
+-                    .commit();
+-            return AppConfig.toBundle(prefs);
+-        }
+-        if ("saveSettings".equals(method)) {
+-            if (extras == null) return Bundle.EMPTY;
+-            int[] values = extras.getIntArray("pool");
+-            List<Integer> pool = new ArrayList<>();
+-            if (values != null) {
+-                for (int value : values) if (value > 0 && !pool.contains(value)) pool.add(value);
+-            }
+-            int lockedId = Math.max(0, extras.getInt("lockedId", 0));
+-            boolean lockedEnabled = extras.getBoolean("lockedEnabled", false) && lockedId > 0;
+-            boolean randomEnabled = extras.getBoolean("randomEnabled", false) && !pool.isEmpty() && !lockedEnabled;
+-            boolean masterEnabled = extras.getBoolean("masterEnabled", false)
+-                    && (lockedEnabled || randomEnabled);
+-            SharedPreferences.Editor editor = prefs.edit()
+-                    .putString("pool", AppConfig.poolJson(pool))
+-                    .putBoolean("masterEnabled", masterEnabled)
+-                    .putBoolean("randomEnabled", randomEnabled)
+-                    .putBoolean("lockedEnabled", lockedEnabled)
+-                    .putInt("lockedId", lockedId)
+-                    .putLong("settingsRevision", System.currentTimeMillis());
+-            if (extras.containsKey("antiRevokeEnabled")) {
+-                editor.putBoolean("antiRevokeEnabled", extras.getBoolean("antiRevokeEnabled", false));
+-            }
+-            if (lockedEnabled) editor.putInt("lastAppliedId", lockedId);
+-            else if (!masterEnabled) editor.putInt("lastAppliedId", 0);
+-            editor.commit();
+-            return AppConfig.toBundle(prefs);
+-        }
+-        if ("restoreDefault".equals(method)) {
+-            prefs.edit().putBoolean("masterEnabled", false).putBoolean("randomEnabled", false)
+-                    .putBoolean("lockedEnabled", false).putInt("lockedId", 0)
+-                    .putInt("lastAppliedId", 0).commit();
+-            return AppConfig.toBundle(prefs);
+-        }
+-        if ("setAntiRevoke".equals(method)) {
+-            boolean enabled = extras != null && extras.getBoolean("enabled", false);
+-            prefs.edit().putBoolean("antiRevokeEnabled", enabled).commit();
+-            return AppConfig.toBundle(prefs);
+-        }
+-        if ("acceptNoticeV36Final1".equals(method)) {
+-            prefs.edit().putBoolean(AppConfig.QQ_NOTICE_V135, true).commit();
+-            return AppConfig.toBundle(prefs);
+-        }
+-        if ("clearRuntimeCache".equals(method)) {
+-            prefs.edit().remove("log").remove("lastLogMessage")
+-                    .remove("lastLogTime").apply();
+-            return AppConfig.toBundle(prefs);
+-        }
+-        if ("addBubble".equals(method) || "applyBubble".equals(method) || "removeBubble".equals(method)) {
+-            int id = extras == null ? 0 : extras.getInt("id", 0);
+-            List<Integer> pool = AppConfig.readPool(prefs);
+-            if ("removeBubble".equals(method)) {
+-                pool.remove(Integer.valueOf(id));
+-                SharedPreferences.Editor editor = prefs.edit().putString("pool", AppConfig.poolJson(pool));
+-                if (pool.isEmpty()) {
+-                    editor.putBoolean("masterEnabled", false).putBoolean("randomEnabled", false)
+-                            .putBoolean("lockedEnabled", false).putInt("lockedId", 0)
+-                            .putInt("lastAppliedId", 0);
+-                }
+-                editor.commit();
+-            } else if (id > 0) {
+-                if (!pool.contains(id)) pool.add(id);
+-                AppConfig.writePool(prefs, pool);
+-                if ("applyBubble".equals(method)) {
+-                    prefs.edit().putBoolean("masterEnabled", true).putBoolean("randomEnabled", false)
+-                            .putBoolean("lockedEnabled", true).putInt("lockedId", id)
+-                            .putInt("lastAppliedId", id).commit();
+-                }
+-            }
+-            Bundle result = new Bundle();
+-            result.putBoolean("contained", id > 0 && pool.contains(id));
+-            return result;
+-        }
+-        if ("recordApplied".equals(method)) {
+-            int id = extras == null ? 0 : extras.getInt("id", 0);
+-            if (id > 0) prefs.edit().putInt("lastAppliedId", id).apply();
+-            return Bundle.EMPTY;
+-        }
+-        if ("appendLog".equals(method)) {
+-            String message = extras == null ? "" : extras.getString("message", "");
+-            appendLog(prefs, message);
+-            return Bundle.EMPTY;
+-        }
+-        if ("clearLog".equals(method)) {
+-            prefs.edit().remove("log").remove("lastLogMessage").remove("lastLogTime").apply();
+-            return Bundle.EMPTY;
+-        }
+-        return Bundle.EMPTY;
+-    }
+-
+-    private static boolean isSupportedMethod(String method) {
+-        if (method == null) return false;
+-        switch (method) {
+-            case "getConfig":
+-            case "healthCheck":
+-            case "reportHook":
+-            case "saveSettings":
+-            case "restoreDefault":
+-            case "setAntiRevoke":
+-            case "acceptNoticeV36Final1":
+-            case "clearRuntimeCache":
+-            case "addBubble":
+-            case "applyBubble":
+-            case "removeBubble":
+-            case "recordApplied":
+-            case "appendLog":
+-            case "clearLog":
+-                return true;
+-            default:
+-                return false;
+-        }
++        return result;
+     }
+ 
+     private boolean isAllowedCaller() {
+@@ -172,79 +34,18 @@
+         if (uid == android.os.Process.myUid()) return true;
+         try {
+             String[] packages = getContext().getPackageManager().getPackagesForUid(uid);
+-            if (packages != null) {
+-                for (String pkg : packages) if (isTrustedPackage(pkg)) return true;
++            if (packages != null) for (String name : packages) {
++                if ("com.tencent.mobileqq".equals(name) || "fun.fpa".equals(name)) return true;
+             }
+-        } catch (Throwable ignored) {
+-        }
+-        // FPA 3.6 can proxy a patched QQ call through its own process/UID. Resolve the real
+-        // caller process as a narrow fallback instead of accepting unknown applications.
+-        try {
+-            Context context = getContext();
+-            ActivityManager manager = context == null ? null
+-                    : (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+-            if (manager != null && manager.getRunningAppProcesses() != null) {
+-                int pid = Binder.getCallingPid();
+-                for (ActivityManager.RunningAppProcessInfo process : manager.getRunningAppProcesses()) {
+-                    if (process != null && process.pid == pid && isTrustedProcess(process.processName)) {
+-                        return true;
+-                    }
+-                }
+-            }
+-        } catch (Throwable ignored) {
+-        }
++        } catch (Throwable ignored) {}
++        // Process names are caller-controlled and cannot authorize another UID.
++        // Other isolated frameworks use the QQ-local store instead.
+         return false;
+     }
+ 
+-    private static boolean isTrustedPackage(String value) {
+-        return "com.tencent.mobileqq".equals(value) || "fun.fpa".equals(value);
+-    }
+-
+-    private static boolean isTrustedProcess(String value) {
+-        return value != null && (value.equals("com.tencent.mobileqq")
+-                || value.startsWith("com.tencent.mobileqq:")
+-                || value.equals("fun.fpa") || value.startsWith("fun.fpa:"));
+-    }
+-
+-    private String callerPackages(int uid) {
+-        try {
+-            Context context = getContext();
+-            String[] packages = context == null ? null : context.getPackageManager().getPackagesForUid(uid);
+-            if (packages == null || packages.length == 0) return "未解析（FPA 代理 UID）";
+-            StringBuilder result = new StringBuilder();
+-            for (String value : packages) {
+-                if (result.length() > 0) result.append(',');
+-                result.append(value == null ? "?" : value);
+-            }
+-            return result.toString();
+-        } catch (Throwable ignored) {
+-            return "解析失败";
+-        }
+-    }
+-
+-    private static void appendLog(SharedPreferences prefs, String message) {
+-        if (message == null || message.trim().isEmpty()) return;
+-        long now = System.currentTimeMillis();
+-        String compact = message.trim();
+-        if (compact.length() > 1200) compact = compact.substring(0, 1200);
+-        if (compact.equals(prefs.getString("lastLogMessage", ""))
+-                && now - prefs.getLong("lastLogTime", 0L) < 60_000L) return;
+-        String stamp = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date(now));
+-        String current = prefs.getString("log", "");
+-        String[] lines = current.split("\\n");
+-        List<String> kept = new ArrayList<>();
+-        int start = Math.max(0, lines.length - 23);
+-        for (int i = start; i < lines.length; i++) if (!lines[i].isEmpty()) kept.add(lines[i]);
+-        kept.add("[" + stamp + "] " + compact.replace('\n', ' '));
+-        StringBuilder output = new StringBuilder();
+-        for (String line : kept) output.append(line).append('\n');
+-        prefs.edit().putString("log", output.toString())
+-                .putString("lastLogMessage", compact).putLong("lastLogTime", now).apply();
+-    }
+-
+-    @Override public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) { return null; }
++    @Override public Cursor query(Uri uri, String[] p, String s, String[] a, String o) { return null; }
+     @Override public String getType(Uri uri) { return null; }
+     @Override public Uri insert(Uri uri, ContentValues values) { return null; }
+-    @Override public int delete(Uri uri, String selection, String[] selectionArgs) { return 0; }
+-    @Override public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) { return 0; }
++    @Override public int delete(Uri uri, String selection, String[] args) { return 0; }
++    @Override public int update(Uri uri, ContentValues v, String s, String[] a) { return 0; }
+ }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/ConfigStore.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/ConfigStore.java
+@@ -0,0 +1,183 @@
++package com.qiutian.bianpaobubble;
++
++import android.content.SharedPreferences;
++import android.os.Bundle;
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++
++/** Transaction rules shared by the exported provider and an isolated QQ host. */
++public final class ConfigStore {
++    private ConfigStore() {}
++
++    public static Bundle call(SharedPreferences prefs, String method, Bundle extras, boolean local) {
++        synchronized (prefs) {
++            try {
++                if (local && prefs.getInt("_schemaVersion", 0) < 37) {
++                    Map<String, ?> old = prefs.getAll();
++                    if (old.containsKey("pool") || old.containsKey("masterEnabled") || old.containsKey("antiRevokeEnabled")) {
++                        // 3.6 did not record a dirty flag for every offline edit. Preserve
++                        // the QQ copy once during migration before contacting any provider.
++                        commit(prefs, prefs.edit().putInt("_schemaVersion", 37).putBoolean("_pendingSync", true), old);
++                    }
++                }
++                if ("getConfig".equals(method)) return AppConfig.toBundle(prefs);
++                if ("healthCheck".equals(method)) {
++                    long token = System.nanoTime();
++                    Map<String, ?> before = prefs.getAll();
++                    commit(prefs, prefs.edit().putLong("_healthProbe", token), before);
++                    boolean valid = prefs.getLong("_healthProbe", Long.MIN_VALUE) == token;
++                    commit(prefs, prefs.edit().remove("_healthProbe"), before);
++                    Bundle value = AppConfig.toBundle(prefs);
++                    value.putBoolean("_healthOk", valid);
++                    return value;
++                }
++                Map<String, ?> before = prefs.getAll();
++                SharedPreferences.Editor edit = prefs.edit();
++                boolean setting = false;
++                if ("saveSettings".equals(method)) {
++                    if (extras == null || extras.getIntArray("pool") == null) throw new IllegalArgumentException("缺少气泡配置");
++                    for (int id : extras.getIntArray("pool")) if (!AppConfig.validId(id)) throw new IllegalArgumentException("无效气泡 ID：" + id);
++                    int requested = extras.getInt("lockedId", 0);
++                    if (requested != 0 && !AppConfig.validId(requested)) throw new IllegalArgumentException("无效固定 ID");
++                    Bundle normalized = AppConfig.normalize(extras);
++                    writeSettings(edit, normalized);
++                    if (extras.containsKey("antiRevokeEnabled")) edit.putBoolean("antiRevokeEnabled", extras.getBoolean("antiRevokeEnabled", false));
++                    if (extras.containsKey(AppConfig.QQ_NOTICE_V135)) edit.putBoolean(AppConfig.QQ_NOTICE_V135, extras.getBoolean(AppConfig.QQ_NOTICE_V135, false));
++                    if (!normalized.getBoolean("masterEnabled", false)) edit.putInt("lastAppliedId", 0);
++                    setting = true;
++                } else if ("addBubble".equals(method) || "applyBubble".equals(method) || "removeBubble".equals(method)) {
++                    int id = extras == null ? 0 : extras.getInt("id", 0);
++                    if (!AppConfig.validId(id)) throw new IllegalArgumentException("无效气泡 ID：" + id);
++                    List<Integer> pool = AppConfig.readPool(prefs);
++                    if ("removeBubble".equals(method)) {
++                        pool.remove(Integer.valueOf(id));
++                        if (pool.isEmpty() || prefs.getInt("lockedId", 0) == id) {
++                            edit.putBoolean("lockedEnabled", false).putInt("lockedId", 0).putInt("lastAppliedId", 0);
++                            boolean random = !pool.isEmpty() && prefs.getBoolean("masterEnabled", true)
++                                    && prefs.getBoolean("randomEnabled", false);
++                            edit.putBoolean("masterEnabled", random).putBoolean("randomEnabled", random);
++                        }
++                    } else {
++                        if (!pool.contains(id)) pool.add(id);
++                        if (pool.size() > AppConfig.MAX_IDS) throw new IllegalArgumentException("气泡 ID 不能超过 " + AppConfig.MAX_IDS + " 个");
++                        if ("applyBubble".equals(method)) edit.putBoolean("masterEnabled", true).putBoolean("randomEnabled", false)
++                                .putBoolean("lockedEnabled", true).putInt("lockedId", id).putInt("lastAppliedId", id);
++                    }
++                    edit.putString("pool", AppConfig.poolJson(pool));
++                    setting = true;
++                } else if ("restoreDefault".equals(method)) {
++                    edit.putBoolean("masterEnabled", false).putBoolean("randomEnabled", false).putBoolean("lockedEnabled", false)
++                            .putInt("lockedId", 0).putInt("lastAppliedId", 0);
++                    setting = true;
++                } else if ("setAntiRevoke".equals(method)) {
++                    edit.putBoolean("antiRevokeEnabled", extras != null && extras.getBoolean("enabled", false));
++                    setting = true;
++                } else if ("acceptNoticeV36Final1".equals(method)) {
++                    edit.putBoolean(AppConfig.QQ_NOTICE_V135, true);
++                    setting = true;
++                } else if ("reportHook".equals(method)) {
++                    edit.putLong("lastHookPing", System.currentTimeMillis()).putString("lastHookVersion", extras == null ? "" : extras.getString("version", ""));
++                } else if ("recordApplied".equals(method)) {
++                    int id = extras == null ? 0 : extras.getInt("id", 0);
++                    if (AppConfig.validId(id)) edit.putInt("lastAppliedId", id);
++                } else if ("appendLog".equals(method)) {
++                    String message = extras == null ? "" : extras.getString("message", "");
++                    appendLog(prefs, edit, message);
++                } else if ("clearLog".equals(method) || "clearRuntimeCache".equals(method)) {
++                    edit.remove("log").remove("lastLogMessage").remove("lastLogTime");
++                } else {
++                    throw new IllegalArgumentException("不支持的配置操作：" + method);
++                }
++                if (setting) {
++                    long previous = prefs.getLong("settingsRevision", 0L);
++                    long incoming = extras == null ? 0L : extras.getLong("settingsRevision", 0L);
++                    long revision = Math.max(previous, incoming);
++                    edit.putLong("settingsRevision", Math.max(System.currentTimeMillis(), revision == Long.MAX_VALUE ? revision : revision + 1L));
++                    if (local) edit.putBoolean("_pendingSync", true).putInt("_schemaVersion", 37);
++                }
++                commit(prefs, edit, before);
++                return AppConfig.toBundle(prefs);
++            } catch (Throwable error) {
++                Bundle failed = new Bundle();
++                failed.putBoolean("_ok", false);
++                failed.putBoolean("_healthOk", false);
++                failed.putString("_error", error.getClass().getSimpleName() + ": " + String.valueOf(error.getMessage()));
++                return failed;
++            }
++        }
++    }
++
++    public static void writeSettings(SharedPreferences.Editor edit, Bundle config) {
++        List<Integer> pool = new ArrayList<>();
++        int[] ids = config.getIntArray("pool");
++        if (ids != null) for (int id : ids) pool.add(id);
++        edit.putString("pool", AppConfig.poolJson(pool)).putBoolean("masterEnabled", config.getBoolean("masterEnabled", false))
++                .putBoolean("randomEnabled", config.getBoolean("randomEnabled", false))
++                .putBoolean("lockedEnabled", config.getBoolean("lockedEnabled", false)).putInt("lockedId", config.getInt("lockedId", 0));
++    }
++
++    public static boolean mirror(SharedPreferences prefs, Bundle config, boolean acknowledge, long expectedRevision) {
++        synchronized (prefs) {
++            if (prefs.getLong("settingsRevision", 0L) != expectedRevision) return false;
++            if (!acknowledge && prefs.getBoolean("_pendingSync", false)) return false;
++            Bundle normalized = AppConfig.normalize(config);
++            Bundle current = AppConfig.toBundle(prefs);
++            boolean same = java.util.Arrays.equals(current.getIntArray("pool"), normalized.getIntArray("pool"))
++                    && current.getInt("lockedId", 0) == normalized.getInt("lockedId", 0)
++                    && current.getLong("settingsRevision", 0L) == normalized.getLong("settingsRevision", 0L);
++            for (String key : new String[]{"masterEnabled", "randomEnabled", "lockedEnabled", "antiRevokeEnabled", AppConfig.QQ_NOTICE_V135}) {
++                same &= current.getBoolean(key, false) == normalized.getBoolean(key, false);
++            }
++            if (same && (!acknowledge || !current.getBoolean("_pendingSync", false))) return true;
++            Map<String, ?> before = prefs.getAll();
++            SharedPreferences.Editor edit = prefs.edit();
++            writeSettings(edit, normalized);
++            edit.putBoolean("antiRevokeEnabled", config.getBoolean("antiRevokeEnabled", false))
++                    .putBoolean(AppConfig.QQ_NOTICE_V135, config.getBoolean(AppConfig.QQ_NOTICE_V135, false))
++                    .putLong("settingsRevision", config.getLong("settingsRevision", 0L)).putInt("_schemaVersion", 37);
++            if (acknowledge) edit.putBoolean("_pendingSync", false);
++            try { commit(prefs, edit, before); return true; }
++            catch (Throwable error) { return false; }
++        }
++    }
++
++    private static void commit(SharedPreferences prefs, SharedPreferences.Editor edit, Map<String, ?> before) {
++        if (edit.commit()) return;
++        // A failed Android commit has already changed the process-local map. Restore it
++        // so a later read cannot mistake unsaved values for a successful transaction.
++        SharedPreferences.Editor rollback = prefs.edit().clear();
++        for (Map.Entry<String, ?> entry : before.entrySet()) {
++            Object v = entry.getValue(); String k = entry.getKey();
++            if (v instanceof String) rollback.putString(k, (String) v);
++            else if (v instanceof Integer) rollback.putInt(k, (Integer) v);
++            else if (v instanceof Long) rollback.putLong(k, (Long) v);
++            else if (v instanceof Boolean) rollback.putBoolean(k, (Boolean) v);
++            else if (v instanceof Float) rollback.putFloat(k, (Float) v);
++            else if (v instanceof Set) {
++                @SuppressWarnings("unchecked") Set<String> set = (Set<String>) v;
++                rollback.putStringSet(k, set);
++            }
++        }
++        rollback.commit();
++        throw new IllegalStateException("配置未能写入存储，请重试");
++    }
++
++    private static void appendLog(SharedPreferences prefs, SharedPreferences.Editor edit, String message) {
++        if (message == null || message.trim().isEmpty()) return;
++        long now = System.currentTimeMillis();
++        String compact = message.trim().replace('\n', ' ');
++        if (compact.length() > 1200) compact = compact.substring(0, 1200);
++        if (compact.equals(prefs.getString("lastLogMessage", "")) && now - prefs.getLong("lastLogTime", 0L) < 60_000L) return;
++        String[] lines = prefs.getString("log", "").split("\n");
++        StringBuilder out = new StringBuilder();
++        for (int i = Math.max(0, lines.length - 23); i < lines.length; i++) if (!lines[i].isEmpty()) out.append(lines[i]).append('\n');
++        out.append('[').append(new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date(now)))
++                .append("] ").append(compact).append('\n');
++        edit.putString("log", out.toString()).putString("lastLogMessage", compact).putLong("lastLogTime", now);
++    }
++}
+--- a/app/src/main/java/com/qiutian/bianpaobubble/MainActivity.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/MainActivity.java
+@@ -91,7 +91,7 @@
+         hero.addView(status, top(7));
+         page.addView(hero, match());
+ 
+-        Button changelog = button("查看更新日志  ·  v3.6", Color.rgb(230, 72, 145));
++        Button changelog = button("查看更新日志  ·  v3.7", Color.rgb(230, 72, 145));
+         changelog.setOnClickListener(v -> showChangelog());
+         page.addView(changelog, spaced());
+ 
+@@ -124,7 +124,7 @@
+                         + GROUP_QQ + "。", PINK_DARK);
+         page.addView(warning, spaced());
+ 
+-        LinearLayout note = card("说明", "基于疑是天上星的气泡脚本，由秋天移植为模块。支持 QQ 9.2.75 及以上，并适配 Android 16、Android 17。", Color.rgb(156, 120, 218));
++        LinearLayout note = card("说明", "基于疑是天上星的气泡脚本，由秋天移植为模块。支持 QQ 9.2.75 及以上，采用传统 Xposed 接口，支持框架隔离时的本地配置保存。", Color.rgb(156, 120, 218));
+         page.addView(note, spaced());
+ 
+         TextView watermarkLabel = label("请勿倒卖  ·  唯一反馈群 " + GROUP_QQ, 12,
+@@ -236,7 +236,7 @@
+         TextView title = label("百变气泡更新日志", 23, TEXT, true);
+         title.setGravity(Gravity.CENTER);
+         body.addView(title, match());
+-        TextView subtitle = label("当前版本 v3.6 · 点击关闭后可随时再次查看", 13, MUTED, false);
++        TextView subtitle = label("当前版本 v3.7 · 点击关闭后可随时再次查看", 13, MUTED, false);
+         subtitle.setGravity(Gravity.CENTER);
+         body.addView(subtitle, top(6));
+ 
+@@ -270,7 +270,7 @@
+     }
+ 
+     private String releaseHistory() {
+-        return "v3.6\n"
++        return ReleaseNotes.V37 + "\n\n历史版本记录\nv3.6\n"
+                 + "• 修复长时间运行后气泡模式状态与发送缓存不同步。\n"
+                 + "• 发送前自动刷新并校正开关状态，无需重新开关即可恢复。\n"
+                 + "• 修复独立安装包清除数据后无法定位模块头像。\n"
+@@ -351,7 +351,7 @@
+             Intent intent = new Intent(Intent.ACTION_SENDTO,
+                     Uri.parse("mailto:" + FEEDBACK_EMAIL));
+             intent.putExtra(Intent.EXTRA_EMAIL, new String[]{FEEDBACK_EMAIL});
+-            intent.putExtra(Intent.EXTRA_SUBJECT, "百变气泡 3.6 Bug 反馈");
++            intent.putExtra(Intent.EXTRA_SUBJECT, "百变气泡 3.7 Bug 反馈");
+             intent.putExtra(Intent.EXTRA_TEXT,
+                     "请描述出现问题的操作步骤，并粘贴“QQ 设置 → 气泡 → 诊断日志”中的检测结果：\n\n");
+             startActivity(Intent.createChooser(intent, "选择邮箱应用发送 Bug 反馈"));
+--- a/app/src/main/java/com/qiutian/bianpaobubble/ReleaseNotes.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/ReleaseNotes.java
+@@ -0,0 +1,21 @@
++package com.qiutian.bianpaobubble;
++
++/** Shared by the launcher and the in-QQ settings page. */
++public final class ReleaseNotes {
++    private ReleaseNotes() {}
++    public static final String V37 = "v3.7 · 修复与流畅性优化\n"
++            + "• 长按仅识别当前消息的气泡属性，过滤默认气泡、表情和贴纸。\n"
++            + "• 商城要求完整 2_ 类型 ID；过滤其他装扮、截断 ID 和冲突参数。\n"
++            + "• 修复离线设置在 Provider 恢复后被旧配置覆盖的问题。\n"
++            + "• 修复错误返回覆盖有效配置、发送缓存长期不刷新的问题。\n"
++            + "• 合并发送记录写入；配置同步移到后台并限制失败重试频率。\n"
++            + "• 修复更换随机池后旧 ID 混入，保持轮内不重复及跨轮去重。\n"
++            + "• 删除正在使用的固定 ID 时同步关闭独立模式。\n"
++            + "• 配置导入检查结构、字段类型、整数范围和 300 个 ID 上限。\n"
++            + "• 保存成功提示等待实际写入；失败恢复已保存的配置。\n"
++            + "• 防撤回同步包逐条过滤，保留同批普通消息及未知字段。\n"
++            + "• 补上底部撤回文字提示，适应键盘遮挡，后台拦截在返回 QQ 后提示。\n"
++            + "• 修复菜单对象误匹配，限制反射缓存与重复日志占用。\n"
++            + "• 增加延迟注入入口；自检分别显示各项 Hook 的安装与触发状态。\n"
++            + "• 沿用原包名、配置位置、头像和界面样式。";
++}
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/AntiRevokeHook.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/AntiRevokeHook.java
+@@ -3,147 +3,133 @@
+ import android.app.Activity;
+ import android.content.Context;
+ import android.graphics.Color;
+-import android.os.Bundle;
++import android.graphics.Rect;
+ import android.os.Handler;
+ import android.os.Looper;
+-import android.text.SpannableString;
+-import android.text.Spanned;
+-import android.text.style.ForegroundColorSpan;
+-import android.text.style.RelativeSizeSpan;
+ import android.view.Gravity;
+ import android.view.View;
+ import android.view.ViewGroup;
+ import android.widget.FrameLayout;
+ import android.widget.TextView;
+ import android.widget.Toast;
+-
++import java.lang.ref.WeakReference;
+ import java.lang.reflect.Method;
+ import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.concurrent.atomic.AtomicLong;
+-
+ import de.robv.android.xposed.XC_MethodHook;
+ import de.robv.android.xposed.XposedBridge;
+ 
+-/** QQNT recall interceptor based on QFun's public onMsfPush strategy. */
++/** QQNT recall interceptor; ordinary and unknown packets always follow QQ's own path. */
+ final class AntiRevokeHook {
+     private static final String MSG_PUSH = "trpc.msg.olpush.OlPushService.MsgPush";
+     private static final String SYNC_PUSH = "trpc.msg.register_proxy.RegisterProxy.InfoSyncPush";
++    private static final String NOTICE = "已拦截对方撤回，消息已保留";
+     private static final AtomicBoolean FIRST_INTERCEPT_LOGGED = new AtomicBoolean(false);
+-    private static final AtomicLong LAST_NOTICE_TIME = new AtomicLong(0L);
++    private static final AtomicBoolean PENDING = new AtomicBoolean(false);
++    private static final AtomicBoolean NOTICE_QUEUED = new AtomicBoolean(false);
+     private static final Handler MAIN = new Handler(Looper.getMainLooper());
+-
++    private static WeakReference<TextView> visibleNotice = new WeakReference<>(null);
++    private static Runnable dismissNotice;
+     private AntiRevokeHook() {}
+ 
+     static void install(ClassLoader loader, Context context) throws Exception {
+         Class<?> proxy = loader.loadClass("com.tencent.qqnt.kernel.nativeinterface.IQQNTWrapperSession$CppProxy");
+-        Method target = null;
++        int installed = 0;
+         for (Method method : proxy.getDeclaredMethods()) {
+             Class<?>[] parameters = method.getParameterTypes();
+-            if ("onMsfPush".equals(method.getName()) && parameters.length >= 2
+-                    && parameters[0] == String.class && parameters[1] == byte[].class) {
+-                target = method;
+-                break;
+-            }
++            if (!"onMsfPush".equals(method.getName()) || method.getReturnType() != void.class
++                    || parameters.length < 2 || parameters[0] != String.class || parameters[1] != byte[].class) continue;
++            method.setAccessible(true);
++            XposedBridge.hookMethod(method, new XC_MethodHook(95) {
++                @Override protected void beforeHookedMethod(MethodHookParam param) {
++                    try {
++                        if (param.args == null || param.args.length < 2) return;
++                        String command = param.args[0] instanceof String ? (String) param.args[0] : "";
++                        if (!MSG_PUSH.equals(command) && !SYNC_PUSH.equals(command)) return;
++                        HookStatus.seen("防撤回");
++                        if (!HostConfig.get(context).getBoolean("antiRevokeEnabled", false)) return;
++                        byte[] payload = param.args[1] instanceof byte[] ? (byte[]) param.args[1] : null;
++                        if (payload == null || payload.length == 0) return;
++                        boolean changed = false;
++                        if (MSG_PUSH.equals(command)) {
++                            if (ProtoLite.isRecallMsgPush(payload) && !ProtoLite.isSelfMsgPush(payload)) {
++                                param.setResult(null); // Skip the known void callback; never send an invalid empty protobuf to QQ.
++                                changed = true;
++                            }
++                        } else {
++                            ProtoLite.RewriteResult result = ProtoLite.stripSyncRecall(payload);
++                            if (result.changed) { param.args[1] = result.bytes; changed = true; }
++                        }
++                        if (!changed) return;
++                        if (FIRST_INTERCEPT_LOGGED.compareAndSet(false, true)) HostConfig.appendLog(context, "防撤回已首次拦截撤回指令");
++                        queueNotice();
++                    } catch (Throwable error) { HookLog.error(context, "防撤回处理失败", error); }
++                }
++            });
++            installed++;
+         }
+-        if (target == null) throw new NoSuchMethodException(proxy.getName() + ".onMsfPush(String, byte[])");
+-        target.setAccessible(true);
+-        XposedBridge.hookMethod(target, new XC_MethodHook(95) {
+-            @Override
+-            protected void beforeHookedMethod(MethodHookParam param) {
+-                try {
+-                    Bundle config = HostConfig.get(context);
+-                    if (!config.getBoolean("antiRevokeEnabled", false)) return;
+-                    String command = param.args[0] instanceof String ? (String) param.args[0] : "";
+-                    byte[] payload = param.args[1] instanceof byte[] ? (byte[]) param.args[1] : null;
+-                    if (payload == null || payload.length == 0) return;
+-                    boolean changed = false;
+-                    if (MSG_PUSH.equals(command)) {
+-                        if (ProtoLite.isRecallMsgPush(payload) && !ProtoLite.isSelfMsgPush(payload)) {
+-                            param.args[1] = new byte[0];
+-                            changed = true;
+-                        }
+-                    } else if (SYNC_PUSH.equals(command)) {
+-                        ProtoLite.RewriteResult result = ProtoLite.stripSyncRecall(payload);
+-                        if (result.changed) {
+-                            param.args[1] = result.bytes;
+-                            changed = true;
+-                        }
+-                    }
+-                    if (changed && FIRST_INTERCEPT_LOGGED.compareAndSet(false, true)) {
+-                        HostConfig.appendLog(context, "防撤回已首次拦截撤回指令");
+-                    }
+-                    if (changed) showRecallNotice(context);
+-                } catch (Throwable error) {
+-                    HookLog.error(context, "防撤回处理失败", error);
+-                }
+-            }
+-        });
++        if (installed == 0) throw new NoSuchMethodException(proxy.getName() + ".onMsfPush(String, byte[]) void");
+     }
+ 
+-    /** Shows one small pink in-QQ confirmation while coalescing duplicate QQ push packets. */
+-    private static void showRecallNotice(Context context) {
+-        long now = System.currentTimeMillis();
+-        while (true) {
+-            long previous = LAST_NOTICE_TIME.get();
+-            if (now - previous < 1_500L) return;
+-            if (LAST_NOTICE_TIME.compareAndSet(previous, now)) break;
++    private static void queueNotice() {
++        PENDING.set(true);
++        if (!NOTICE_QUEUED.compareAndSet(false, true)) return;
++        MAIN.postDelayed(() -> {
++            NOTICE_QUEUED.set(false);
++            onActivityResumed(BubbleXposedInit.currentActivity());
++        }, 180L);
++    }
++    static void onActivityResumed(Activity activity) {
++        if (activity == null || activity.isFinishing() || activity.isDestroyed() || !PENDING.get()) return;
++        if (Looper.myLooper() != Looper.getMainLooper()) { MAIN.post(() -> onActivityResumed(activity)); return; }
++        if (!PENDING.compareAndSet(true, false)) return;
++        if (!showInQq(activity)) {
++            try { Toast.makeText(activity, NOTICE, Toast.LENGTH_LONG).show(); }
++            catch (Throwable ignored) { PENDING.set(true); }
+         }
+-        Context app = context == null ? null : context.getApplicationContext();
+-        if (app == null) return;
+-        MAIN.post(() -> {
+-            Activity activity = BubbleXposedInit.currentActivity();
+-            if (showInQq(activity)) return;
+-            try {
+-                SpannableString message = new SpannableString("已拦截对方撤回的一条消息");
+-                message.setSpan(new ForegroundColorSpan(Color.rgb(232, 61, 139)), 0,
+-                        message.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+-                message.setSpan(new RelativeSizeSpan(0.88f), 0, message.length(),
+-                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+-                Toast.makeText(app, message, Toast.LENGTH_SHORT).show();
+-            } catch (Throwable ignored) {
+-            }
+-        });
+     }
+-
+     private static boolean showInQq(Activity activity) {
+-        if (activity == null) return false;
+         try {
+-            View content = activity.findViewById(android.R.id.content);
+-            if (!(content instanceof FrameLayout)) return false;
+-            FrameLayout root = (FrameLayout) content;
++            if (activity.getWindow() == null) return false;
++            View decor = activity.getWindow().getDecorView();
++            if (!(decor instanceof ViewGroup)) return false;
++            // The activity content may be a ConstraintLayout or a framework wrapper.
++            // Attach our own small overlay to the decor instead of assuming content is a FrameLayout.
++            ViewGroup root = (ViewGroup) decor;
++            TextView old = visibleNotice.get();
++            if (dismissNotice != null) MAIN.removeCallbacks(dismissNotice);
++            if (old != null && old.getParent() instanceof ViewGroup) ((ViewGroup) old.getParent()).removeView(old);
+             TextView notice = new TextView(activity);
+-            notice.setText("已拦截对方撤回的一条消息");
++            notice.setText(NOTICE);
+             notice.setTextSize(12f);
+             notice.setTextColor(Color.rgb(232, 61, 139));
+             notice.setGravity(Gravity.CENTER);
+             notice.setPadding(dp(activity, 14), dp(activity, 8), dp(activity, 14), dp(activity, 8));
+             android.graphics.drawable.GradientDrawable background = new android.graphics.drawable.GradientDrawable();
+-            background.setColor(Color.argb(238, 255, 242, 249));
++            background.setColor(Color.argb(248, 255, 242, 249));
+             background.setCornerRadius(dp(activity, 18));
+             background.setStroke(dp(activity, 1), Color.argb(185, 255, 255, 255));
+             notice.setBackground(background);
+-            notice.setElevation(dp(activity, 7));
+-            notice.setAlpha(0f);
+-            notice.setTranslationY(dp(activity, 8));
++            notice.setElevation(dp(activity, 12));
++            notice.setMaxWidth(Math.max(dp(activity, 180), root.getWidth() - dp(activity, 32)));
++            Rect visible = new Rect();
++            decor.getWindowVisibleDisplayFrame(visible);
++            int[] location = new int[2];
++            decor.getLocationOnScreen(location);
++            int obscuredBottom = Math.max(0, location[1] + decor.getHeight() - visible.bottom);
+             FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                     Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+-            params.bottomMargin = dp(activity, 92);
++            params.bottomMargin = obscuredBottom + dp(activity, 80);
+             root.addView(notice, params);
+-            notice.animate().alpha(1f).translationY(0f).setDuration(160L).start();
+-            notice.postDelayed(() -> notice.animate().alpha(0f).translationY(-dp(activity, 5))
+-                    .setDuration(220L).withEndAction(() -> {
+-                        try {
+-                            root.removeView(notice);
+-                        } catch (Throwable ignored) {
+-                        }
+-                    }).start(), 1_850L);
++            visibleNotice = new WeakReference<>(notice);
++            dismissNotice = () -> {
++                if (notice.getParent() instanceof ViewGroup) ((ViewGroup) notice.getParent()).removeView(notice);
++                if (visibleNotice.get() == notice) { visibleNotice.clear(); dismissNotice = null; }
++            };
++            MAIN.postDelayed(dismissNotice, 3_200L);
+             return true;
+-        } catch (Throwable ignored) {
+-            return false;
+-        }
++        } catch (Throwable ignored) { return false; }
+     }
+-
+     private static int dp(Context context, int value) {
+         return Math.round(value * context.getResources().getDisplayMetrics().density);
+     }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/BubbleDialog.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/BubbleDialog.java
+@@ -52,12 +52,13 @@
+             add.setEnabled(!contained);
+             add.setAlpha(contained ? 0.45f : 1f);
+             add.setOnClickListener(v -> {
+-                int[] updated = addId(pool, id);
+-                HostConfig.stageSettings(config.getBoolean("masterEnabled", true),
+-                        config.getBoolean("randomEnabled", true), config.getBoolean("lockedEnabled", false),
+-                        config.getInt("lockedId", 0), updated);
+-                HostConfig.runAsync(() -> HostConfig.call(activity, "addBubble", id));
+-                Toast.makeText(activity, "已加入随机气泡池", Toast.LENGTH_SHORT).show();
++                Bundle latest = HostConfig.get(activity);
++                int[] updated = addId(latest.getIntArray("pool"), id);
++                if (!checkPoolLimit(activity, updated)) return;
++                HostConfig.stageSettings(latest.getBoolean("masterEnabled", false),
++                        latest.getBoolean("randomEnabled", false), latest.getBoolean("lockedEnabled", false),
++                        latest.getInt("lockedId", 0), updated);
++                ConfigUi.write(activity, () -> HostConfig.call(activity, "addBubble", id), "已加入随机气泡池", null);
+                 dialog.dismiss();
+             });
+             Button remove = button(activity, "取消气泡 ID", Color.rgb(246, 240, 244));
+@@ -65,12 +66,14 @@
+             remove.setEnabled(contained);
+             remove.setAlpha(contained ? 1f : 0.45f);
+             remove.setOnClickListener(v -> {
+-                int[] updated = removeId(pool, id);
+-                boolean random = config.getBoolean("randomEnabled", true) && updated.length > 0;
+-                HostConfig.stageSettings(config.getBoolean("masterEnabled", true), random,
+-                        config.getBoolean("lockedEnabled", false), config.getInt("lockedId", 0), updated);
+-                HostConfig.runAsync(() -> HostConfig.call(activity, "removeBubble", id));
+-                Toast.makeText(activity, "已从随机气泡池移除", Toast.LENGTH_SHORT).show();
++                Bundle latest = HostConfig.get(activity);
++                int[] updated = removeId(latest.getIntArray("pool"), id);
++                boolean random = latest.getBoolean("randomEnabled", false) && updated.length > 0;
++                int lockedId = latest.getInt("lockedId", 0);
++                if (lockedId == id || updated.length == 0) lockedId = 0;
++                boolean locked = latest.getBoolean("lockedEnabled", false) && lockedId > 0;
++                HostConfig.stageSettings(random || locked, random, locked, lockedId, updated);
++                ConfigUi.write(activity, () -> HostConfig.call(activity, "removeBubble", id), "已从随机气泡池移除", null);
+                 dialog.dismiss();
+             });
+             actions.addView(add, weighted());
+@@ -90,7 +93,7 @@
+     }
+ 
+     static void showMall(Activity activity, int id) {
+-        if (!valid(activity) || id <= 0) return;
++        if (!valid(activity) || !isValidBubbleId(id)) return;
+         activity.runOnUiThread(() -> {
+             Dialog dialog = baseDialog(activity, "BUBBLE MALL", "发现气泡资源", "气泡 ID：" + id,
+                     "请选择使用方式，不会再默认切换模式");
+@@ -99,9 +102,9 @@
+             locked.setOnClickListener(v -> {
+                 Bundle config = HostConfig.get(activity);
+                 int[] updated = addId(config.getIntArray("pool"), id);
++                if (!checkPoolLimit(activity, updated)) return;
+                 HostConfig.stageSettings(true, false, true, id, updated);
+-                HostConfig.runAsync(() -> HostConfig.call(activity, "applyBubble", id));
+-                Toast.makeText(activity, "已设为独立气泡", Toast.LENGTH_SHORT).show();
++                ConfigUi.write(activity, () -> HostConfig.call(activity, "applyBubble", id), "已设为独立气泡", null);
+                 dialog.dismiss();
+             });
+             body.addView(locked, matchTop(activity, 16));
+@@ -110,10 +113,10 @@
+             random.setOnClickListener(v -> {
+                 Bundle config = HostConfig.get(activity);
+                 int[] updated = addId(config.getIntArray("pool"), id);
++                if (!checkPoolLimit(activity, updated)) return;
+                 HostConfig.stageSettings(true, true, false, 0, updated);
+-                HostConfig.runAsync(() -> HostConfig.saveSettings(activity,
+-                        true, true, false, 0, updated));
+-                Toast.makeText(activity, "已加入随机气泡并启用随机模式", Toast.LENGTH_SHORT).show();
++                ConfigUi.write(activity, () -> HostConfig.saveSettings(activity,
++                        true, true, false, 0, updated), "已加入随机气泡并启用随机模式", null);
+                 dialog.dismiss();
+             });
+             body.addView(random, matchTop(activity, 10));
+@@ -187,8 +190,15 @@
+ 
+     private static void copy(Activity activity, int id) {
+         ClipboardManager manager = (ClipboardManager) activity.getSystemService(Activity.CLIPBOARD_SERVICE);
++        if (manager == null) return;
+         manager.setPrimaryClip(ClipData.newPlainText("bubble_id", String.valueOf(id)));
+         Toast.makeText(activity, "已复制气泡 ID：" + id, Toast.LENGTH_SHORT).show();
++    }
++
++    private static boolean checkPoolLimit(Activity activity, int[] pool) {
++        if (pool.length <= com.qiutian.bianpaobubble.AppConfig.MAX_IDS) return true;
++        Toast.makeText(activity, "气泡池最多保存 300 个 ID", Toast.LENGTH_SHORT).show();
++        return false;
+     }
+ 
+     private static boolean contains(int[] values, int target) {
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/BubbleRandomBag.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/BubbleRandomBag.java
+@@ -12,18 +12,20 @@
+ final class BubbleRandomBag {
+     private int[] bag = new int[0];
+     private int index;
+-    private int fingerprint;
++    private int[] source = new int[0];
+     private int lastId;
+ 
+     synchronized int next(int[] pool, int persistedLastId) {
+-        int[] unique = uniquePositive(pool);
+-        if (unique.length == 0) return 0;
+-        if (lastId <= 0 && persistedLastId > 0) lastId = persistedLastId;
+-
+-        int nextFingerprint = Arrays.hashCode(unique);
+-        if (index >= bag.length || fingerprint != nextFingerprint) {
+-            bag = Arrays.copyOf(unique, unique.length);
+-            fingerprint = nextFingerprint;
++        if (pool == null || pool.length == 0) { source = new int[0]; bag = new int[0]; index = 0; return 0; }
++        boolean changed = !Arrays.equals(source, pool);
++        if (changed) {
++            source = pool.clone();
++            bag = uniquePositive(pool);
++            index = bag.length;
++        }
++        if (bag.length == 0) return 0;
++        if (lastId == 0 && persistedLastId >= 1000) lastId = persistedLastId;
++        if (index >= bag.length) {
+             index = 0;
+             shuffle(bag);
+             avoidBoundaryRepeat(bag, lastId);
+@@ -34,17 +36,19 @@
+         return selected;
+     }
+ 
++    synchronized void noteApplied(int id) { if (id >= 1000) lastId = id; }
++
+     synchronized void resetForTest() {
+         bag = new int[0];
+         index = 0;
+-        fingerprint = 0;
++        source = new int[0];
+         lastId = 0;
+     }
+ 
+     private static int[] uniquePositive(int[] pool) {
+         if (pool == null || pool.length == 0) return new int[0];
+         Set<Integer> values = new LinkedHashSet<>();
+-        for (int id : pool) if (id > 0) values.add(id);
++        for (int id : pool) if (id >= 1000) values.add(id);
+         int[] result = new int[values.size()];
+         int offset = 0;
+         for (Integer value : values) result[offset++] = value;
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/BubbleXposedInit.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/BubbleXposedInit.java
+@@ -34,9 +34,8 @@
+ import java.util.WeakHashMap;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicBoolean;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+-
++
++import de.robv.android.xposed.AndroidAppHelper;
+ import de.robv.android.xposed.IXposedHookLoadPackage;
+ import de.robv.android.xposed.IXposedHookZygoteInit;
+ import de.robv.android.xposed.XC_MethodHook;
+@@ -46,8 +45,6 @@
+ 
+ public final class BubbleXposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit {
+     private static final String QQ_PACKAGE = "com.tencent.mobileqq";
+-    private static final Pattern BUBBLE_MARKER = Pattern.compile(
+-            "(?i)(?:itemid|item_id|kr_turbo_display)[\\\"']?\\s*(?:=|:)\\s*[\\\"']?(?:2_)?([0-9]{4,10})");
+     private static final Set<String> MENU_METHODS = Collections.newSetFromMap(new ConcurrentHashMap<>());
+     private static final AtomicBoolean MODERN_MENU_SEEN = new AtomicBoolean(false);
+     private static final AtomicBoolean MODERN_MENU_INSERTED = new AtomicBoolean(false);
+@@ -58,6 +55,7 @@
+     private static volatile ClassLoader qqLoader;
+     private static volatile boolean initialized;
+     private static final BubbleRandomBag RANDOM_BAG = new BubbleRandomBag();
++    private static final ThreadLocal<Integer> SEND_DEPTH = new ThreadLocal<>();
+     private static final AtomicBoolean SETTINGS_ENTRY_LOGGED = new AtomicBoolean(false);
+     private static volatile int menuIconRes;
+     private static volatile String modulePath;
+@@ -75,50 +73,46 @@
+ 
+     @Override
+     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+-        if (!QQ_PACKAGE.equals(lpparam.packageName) || !QQ_PACKAGE.equals(lpparam.processName)) return;
+-        XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook(100) {
+-            @Override
+-            protected void afterHookedMethod(MethodHookParam param) {
+-                if (initialized) return;
+-                synchronized (BubbleXposedInit.class) {
+-                    if (initialized) return;
+-                    Context context = (Context) param.args[0];
+-                    String version = qqVersion(context);
+-                    if (AppConfig.compareVersion(version, AppConfig.MIN_QQ_VERSION) < 0) {
+-                        HookLog.info("QQ " + version + " 低于最低支持版本 " + AppConfig.MIN_QQ_VERSION + "，已停止 Hook");
+-                        return;
+-                    }
+-                    qqContext = context.getApplicationContext();
+-                    qqLoader = context.getClassLoader();
+-                    // FPA and other virtualized Xposed loaders may expose a copied or
+-                    // framework-owned modulePath. Never let archive inspection abort the
+-                    // entire QQ Hook chain before the settings entry is installed.
+-                    try {
+-                        SignatureGuard.enforceArchiveIfReadable(qqContext, modulePath);
+-                    } catch (Throwable signatureError) {
+-                        HookLog.error(qqContext, "框架模块路径签名检测已跳过", signatureError);
+-                    }
+-                    // Do not mount the module resource table into QQ. Multiple modules adding
+-                    // ResourcesLoader/AssetManager paths can invalidate each other's resource ids.
+-                    // The real avatar is decoded directly from our APK by ModuleIcon; this host id
+-                    // is only a harmless fallback for QQ menu implementations without custom views.
+-                    menuIconRes = context.getResources().getIdentifier(
+-                            "qui_tuning", "drawable", QQ_PACKAGE);
+-                    if (menuIconRes <= 0) menuIconRes = android.R.drawable.sym_def_app_icon;
+-                    try {
+-                        HostConfig.reportHook(qqContext, version);
+-                    } catch (Throwable configError) {
+-                        HookLog.error(qqContext, "Hook 状态同步已跳过", configError);
+-                    }
+-                    // Mark initialized only after all mandatory host objects are ready.
+-                    // Each feature below is isolated by safeInstall, so one optional
+-                    // failure can no longer suppress the QQ settings entry.
+-                    initialized = true;
+-                    installAll(qqLoader, qqContext);
+-                    HookLog.info("已加载，QQ " + version);
+-                }
+-            }
+-        });
++        if (!QQ_PACKAGE.equals(lpparam.packageName)) return;
++        // Isolated loaders can rename the primary process. Still skip QQ's known subprocesses.
++        if (lpparam.processName != null && lpparam.processName.startsWith(QQ_PACKAGE + ":")) return;
++        try {
++            XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook(100) {
++                @Override protected void afterHookedMethod(MethodHookParam param) {
++                    Context context = param.thisObject instanceof Context ? (Context) param.thisObject : (Context) param.args[0];
++                    initialize(context, lpparam.classLoader);
++                }
++            });
++        } catch (Throwable error) { HookLog.info("Application.attach 挂载失败：" + error.getClass().getSimpleName()); }
++        // Rootless/late-injection frameworks may invoke handleLoadPackage after attach.
++        try {
++            Application running = AndroidAppHelper.currentApplication();
++            if (running != null && QQ_PACKAGE.equals(running.getPackageName())) initialize(running, lpparam.classLoader);
++        } catch (Throwable error) { HookLog.info("延迟注入检查：" + error.getClass().getSimpleName()); }
++    }
++
++    private static synchronized void initialize(Context context, ClassLoader fallbackLoader) {
++        if (initialized || context == null) return;
++        String version = qqVersion(context);
++        if (AppConfig.compareVersion(version, AppConfig.MIN_QQ_VERSION) < 0) {
++            HookLog.info("QQ " + version + " 低于最低支持版本 " + AppConfig.MIN_QQ_VERSION + "，已停止 Hook");
++            return;
++        }
++        Context app = context.getApplicationContext();
++        qqContext = app == null ? context : app;
++        qqLoader = context.getClassLoader();
++        if (qqLoader == null) qqLoader = fallbackLoader;
++        try { qqLoader.loadClass("com.tencent.qqnt.kernel.nativeinterface.IKernelMsgService$CppProxy"); }
++        catch (Throwable ignored) { if (fallbackLoader != null) qqLoader = fallbackLoader; }
++        try { SignatureGuard.enforceArchiveIfReadable(qqContext, modulePath); }
++        catch (Throwable error) { HookLog.error(qqContext, "框架模块路径签名检测已跳过", error); }
++        menuIconRes = context.getResources().getIdentifier("qui_tuning", "drawable", QQ_PACKAGE);
++        if (menuIconRes <= 0) menuIconRes = android.R.drawable.sym_def_app_icon;
++        initialized = true;
++        HookStatus.started();
++        installAll(qqLoader, qqContext);
++        HostConfig.reportHook(qqContext, version);
++        HookLog.info("3.7 已加载，QQ " + version);
+     }
+ 
+     private static void installAll(ClassLoader loader, Context context) {
+@@ -134,7 +128,9 @@
+     private static void safeInstall(Context context, String name, ThrowingRunnable action) {
+         try {
+             action.run();
++            HookStatus.installed(name);
+         } catch (Throwable e) {
++            HookStatus.failed(name, e);
+             HookLog.error(context, name + "初始化失败", e);
+         }
+     }
+@@ -148,6 +144,12 @@
+                     currentActivity = new WeakReference<>(activity);
+                     HostConfig.reportHook(context, qqVersion(context));
+                     scheduleSettingsEntryRebind(activity);
++                    AntiRevokeHook.onActivityResumed(activity);
++                }
++            });
++            XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook(-100) {
++                @Override protected void afterHookedMethod(MethodHookParam param) {
++                    if (currentActivity.get() == param.thisObject) currentActivity = new WeakReference<>(null);
+                 }
+             });
+         } catch (Throwable e) {
+@@ -340,50 +342,47 @@
+ 
+     private static void installSendHook(ClassLoader loader, Context context) throws Exception {
+         Class<?> proxy = loader.loadClass("com.tencent.qqnt.kernel.nativeinterface.IKernelMsgService$CppProxy");
+-        List<Method> candidates = new ArrayList<>();
++        int installed = 0;
+         for (Method method : proxy.getDeclaredMethods()) {
+-            if ("sendMsg".equals(method.getName()) && method.getParameterTypes().length >= 4) candidates.add(method);
+-        }
+-        if (candidates.isEmpty()) throw new NoSuchMethodException("IKernelMsgService.CppProxy.sendMsg");
+-        candidates.sort(Comparator.comparingInt((Method method) -> method.getParameterTypes().length).reversed());
+-        Method target = null;
+-        for (Method method : candidates) {
+-            Class<?> fourth = method.getParameterTypes()[3];
+-            if (Map.class.isAssignableFrom(fourth) || fourth.getName().contains("Map")) {
+-                target = method;
+-                break;
+-            }
+-        }
+-        if (target == null) target = candidates.get(0);
+-        target.setAccessible(true);
+-        XposedBridge.hookMethod(target, new XC_MethodHook(80) {
+-            @Override
+-            protected void beforeHookedMethod(MethodHookParam param) {
+-                try {
+-                    Bundle config = HostConfig.getForSend(context);
+-                    if (!config.getBoolean("masterEnabled", false)) return;
+-                    Object attrs = param.args != null && param.args.length > 3 ? param.args[3] : null;
+-                    Object bubble = Reflector.bubbleInfoFromAttrs(attrs);
+-                    if (bubble == null) bubble = Reflector.bubbleInfoFromArgs(param.args);
+-                    if (bubble == null) return;
+-                    int targetId = 0;
+-                    if (config.getBoolean("lockedEnabled", false)) targetId = config.getInt("lockedId", 0);
+-                    if (targetId <= 0 && config.getBoolean("randomEnabled", false)) {
+-                        int[] pool = config.getIntArray("pool");
+-                        if (pool != null && pool.length > 0) {
+-                            targetId = RANDOM_BAG.next(pool, config.getInt("lastAppliedId", 0));
++            if (!"sendMsg".equals(method.getName())) continue;
++            boolean hasAttributes = false;
++            for (Class<?> type : method.getParameterTypes()) if (Map.class.isAssignableFrom(type)) hasAttributes = true;
++            if (!hasAttributes) continue;
++            method.setAccessible(true);
++            XposedBridge.hookMethod(method, new XC_MethodHook(80) {
++                @Override protected void beforeHookedMethod(MethodHookParam param) {
++                    Integer previous = SEND_DEPTH.get();
++                    int depth = previous == null ? 0 : previous;
++                    SEND_DEPTH.set(depth + 1);
++                    param.setObjectExtra("bbSendEntered", Boolean.TRUE);
++                    if (depth > 0) return; // Delegating overloads must consume only one random ID.
++                    try {
++                        HookStatus.seen("发送气泡");
++                        Bundle config = HostConfig.getForSend(context);
++                        if (!config.getBoolean("masterEnabled", false)) return;
++                        Object bubble = Reflector.bubbleInfoFromArgs(param.args);
++                        if (bubble == null) return;
++                        int targetId = config.getBoolean("lockedEnabled", false) ? config.getInt("lockedId", 0) : 0;
++                        if (!AppConfig.validId(targetId) && config.getBoolean("randomEnabled", false)) {
++                            targetId = RANDOM_BAG.next(config.getIntArray("pool"), config.getInt("lastAppliedId", 0));
+                         }
+-                    }
+-                    if (targetId <= 0) return;
+-                    boolean changed = Reflector.setNumber(bubble, "subBubbleId", targetId);
+-                    changed = Reflector.setNumber(bubble, "bubbleId", targetId) || changed;
+-                    if (!changed) throw new NoSuchFieldException("bubbleInfo.subBubbleId/bubbleId");
+-                    HostConfig.noteApplied(context, targetId);
+-                } catch (Throwable e) {
+-                    HookLog.error(context, "发送气泡处理失败", e);
+-                }
+-            }
+-        });
++                        if (!AppConfig.validId(targetId)) return;
++                        boolean changed = Reflector.setNumber(bubble, "subBubbleId", targetId);
++                        changed = Reflector.setNumber(bubble, "bubbleId", targetId) || changed;
++                        if (!changed) throw new NoSuchFieldException("bubbleInfo.subBubbleId/bubbleId");
++                        RANDOM_BAG.noteApplied(targetId);
++                        HostConfig.noteApplied(context, targetId);
++                    } catch (Throwable error) { HookLog.error(context, "发送气泡处理失败", error); }
++                }
++                @Override protected void afterHookedMethod(MethodHookParam param) {
++                    if (!Boolean.TRUE.equals(param.getObjectExtra("bbSendEntered"))) return;
++                    Integer depth = SEND_DEPTH.get();
++                    if (depth == null || depth <= 1) SEND_DEPTH.remove(); else SEND_DEPTH.set(depth - 1);
++                }
++            });
++            installed++;
++        }
++        if (installed == 0) throw new NoSuchMethodException("IKernelMsgService.CppProxy.sendMsg(..., Map, ...)");
+     }
+ 
+     private static void installMessageMenu(ClassLoader loader, Context context) throws Exception {
+@@ -438,10 +437,12 @@
+                                 new IllegalStateException(menu.items.get(0).getClass().getName()));
+                         return;
+                     }
++                    HookStatus.seen("长按菜单");
+                     if (MODERN_MENU_SEEN.compareAndSet(false, true)) {
+                         HostConfig.appendLog(context, "新版长按菜单已触发：menu="
+                                 + param.args[0].getClass().getName() + "，items=" + menu.items.size());
+                     }
++                    if (!BubbleDialog.isValidBubbleId(Reflector.bubbleId(msg))) return;
+                     if (NtMenuFactory.containsOwned(menu.items)) return;
+                     Context itemContext = currentActivity.get();
+                     if (itemContext == null) itemContext = context;
+@@ -635,14 +636,14 @@
+ 
+     private static void hookMenuComponent(Class<?> component, String menuMethodName, Method getMsg,
+                                           ClassLoader loader, Context context) throws Exception {
+-        String hookKey = component.getName() + '#' + menuMethodName;
++        Method menu = findNoArgMethod(component, menuMethodName);
++        if (menu == null || Modifier.isAbstract(menu.getModifiers()) || !List.class.isAssignableFrom(menu.getReturnType())) {
++            throw new NoSuchMethodException(component.getName() + "." + menuMethodName);
++        }
++        String hookKey = menu.toGenericString();
+         if (!MENU_METHODS.add(hookKey)) return;
+-        Method menu = findNoArgMethod(component, menuMethodName);
+-        if (menu == null) {
+-            MENU_METHODS.remove(hookKey);
+-            throw new NoSuchMethodException(component.getName() + "." + menuMethodName);
+-        }
+         menu.setAccessible(true);
++        try {
+         XposedBridge.hookMethod(menu, new XC_MethodHook(48) {
+             @Override
+             @SuppressWarnings("unchecked")
+@@ -654,8 +655,9 @@
+                                 new IllegalStateException(component.getName() + '#' + menuMethodName));
+                         return;
+                     }
++                    HookStatus.seen("长按菜单");
+                     Object msg = getMsg.invoke(param.thisObject);
+-                    if (msg == null) return;
++                    if (msg == null || !BubbleDialog.isValidBubbleId(Reflector.bubbleId(msg))) return;
+                     List<Object> items = (List<Object>) result;
+                     if (NtMenuFactory.containsOwned(items)) return;
+                     Context itemContext = currentActivity.get();
+@@ -681,6 +683,10 @@
+                 }
+             }
+         });
++        } catch (RuntimeException error) {
++            MENU_METHODS.remove(hookKey);
++            throw error;
++        }
+     }
+ 
+     private static void installMallHook(ClassLoader loader, Context context) throws Exception {
+@@ -696,8 +702,9 @@
+                 AtomicBoolean shown = new AtomicBoolean(false);
+                 int[] delays = {320, 850, 1600};
+                 for (int delay : delays) decor.postDelayed(() -> {
+-                    if (shown.get() || activity.isFinishing()) return;
++                    if (shown.get() || activity.isFinishing() || activity.isDestroyed()) return;
+                     try {
++                        HookStatus.seen("商城识别");
+                         int id = mallBubbleId(activity);
+                         if (id > 0 && shown.compareAndSet(false, true)) {
+                             HostConfig.appendLog(context, "商城气泡识别成功 | id=" + id);
+@@ -890,152 +897,35 @@
+     }
+ 
+     private static int mallBubbleId(Activity activity) {
++        MallIdParser.Selection selection = new MallIdParser.Selection();
+         Intent intent = activity.getIntent();
+-        String evidence = mallEvidence(activity, intent);
+-        if (!isBubbleEvidence(evidence)) return 0;
+         if (intent != null) {
+-            int id = findIdInBundle(intent.getExtras(), 0);
+-            if (id > 0) return id;
+-            id = parseMarker(String.valueOf(intent.getDataString()));
+-            if (id > 0) return id;
+-            try {
+-                id = parseMarker(intent.toUri(0));
+-                if (id > 0) return id;
+-            } catch (Throwable ignored) {
+-            }
++            collectMallBundle(intent.getExtras(), selection, 0);
++            MallIdParser.collect(intent.getDataString(), selection);
+         }
+         Object fragment = Reflector.field(activity, "mFrag");
+-        if (fragment != null) {
+-            Object args = Reflector.invokeNoArgs(fragment, "getArguments");
+-            if (args instanceof Bundle) {
+-                int id = findIdInBundle((Bundle) args, 0);
+-                if (id > 0) return id;
+-            }
+-            int deepId = findIdInObject(fragment, 0, new IdentityHashMap<>());
+-            if (deepId > 0) return deepId;
+-            int id = parseMarker(String.valueOf(Reflector.invokeNoArgs(fragment, "getBusinessDescription")));
+-            if (id > 0) return id;
+-        }
+-        return 0;
+-    }
+-
+-    private static String mallEvidence(Activity activity, Intent intent) {
+-        StringBuilder value = new StringBuilder();
+-        try {
+-            if (intent != null) value.append(intent.toUri(0)).append(' ');
+-        } catch (Throwable ignored) {
+-        }
+-        try {
+-            if (intent != null && intent.getExtras() != null) value.append(intent.getExtras()).append(' ');
+-        } catch (Throwable ignored) {
+-        }
+-        Object fragment = Reflector.field(activity, "mFrag");
+-        if (fragment != null) {
+-            value.append(fragment.getClass().getName()).append(' ');
+-            Object description = Reflector.invokeNoArgs(fragment, "getBusinessDescription");
+-            if (description != null) value.append(description);
+-            Object arguments = Reflector.invokeNoArgs(fragment, "getArguments");
+-            if (arguments != null) value.append(' ').append(arguments);
+-        }
+-        return value.toString().toLowerCase();
+-    }
+-
+-    private static boolean isBubbleEvidence(String value) {
+-        if (value == null) return false;
+-        String lower = value.toLowerCase();
+-        // QQ's VAS item type prefix 2_ identifies message bubbles. The surrounding
+-        // mall Activity and fragment are shared by themes, avatars and pendants, so
+-        // generic words such as "bubble" are not sufficient evidence.
+-        return Pattern.compile(
+-                "(?i)(?:itemid|item_id|kr_turbo_display)[\\\"']?\\s*(?:=|:)\\s*[\\\"']?2_[0-9]{4,10}")
+-                .matcher(lower).find();
+-    }
+-
+-    private static int findIdInObject(Object object, int depth, IdentityHashMap<Object, Boolean> visited) {
+-        if (object == null || depth > 4 || visited.size() > 140 || visited.put(object, Boolean.TRUE) != null) return 0;
+-        if (object instanceof Bundle) return findIdInBundle((Bundle) object, depth);
+-        if (object instanceof CharSequence || object instanceof Uri) return parseMarker(String.valueOf(object));
+-        if (object instanceof Map) {
+-            for (Object entryObject : ((Map<?, ?>) object).entrySet()) {
+-                Map.Entry<?, ?> entry = (Map.Entry<?, ?>) entryObject;
+-                String key = String.valueOf(entry.getKey()).toLowerCase();
+-                Object value = entry.getValue();
+-                if (key.equals("itemid") || key.equals("item_id") || key.equals("kr_turbo_display")) {
+-                    int direct = directId(String.valueOf(value));
+-                    if (direct > 0) return direct;
+-                }
+-                int nested = findIdInObject(value, depth + 1, visited);
+-                if (nested > 0) return nested;
+-            }
+-            return 0;
+-        }
+-        String className = object.getClass().getName();
+-        if (!className.startsWith("com.tencent.") && !className.contains("Kuikly")) return 0;
+-        Class<?> current = object.getClass();
+-        while (current != null && current != Object.class) {
+-            for (Field field : current.getDeclaredFields()) {
+-                if (Modifier.isStatic(field.getModifiers()) || field.getType().isPrimitive()) continue;
+-                try {
+-                    field.setAccessible(true);
+-                    Object value = field.get(object);
+-                    if (value == null || value == object) continue;
+-                    String key = field.getName().toLowerCase();
+-                    if (key.equals("itemid") || key.equals("item_id") || key.contains("turbo_display")) {
+-                        int direct = directId(String.valueOf(value));
+-                        if (direct > 0) return direct;
+-                    }
+-                    int nested = findIdInObject(value, depth + 1, visited);
+-                    if (nested > 0) return nested;
+-                } catch (Throwable ignored) {
+-                }
+-            }
+-            current = current.getSuperclass();
+-        }
+-        return 0;
+-    }
+-
+-    private static int findIdInBundle(Bundle bundle, int depth) {
+-        if (bundle == null || depth > 3) return 0;
++        Object arguments = Reflector.invokeNoArgs(fragment, "getArguments");
++        if (arguments instanceof Bundle) collectMallBundle((Bundle) arguments, selection, 0);
++        Object description = Reflector.invokeNoArgs(fragment, "getBusinessDescription");
++        if (description instanceof CharSequence) MallIdParser.collect(description.toString(), selection);
++        return selection.value();
++    }
++
++    private static void collectMallBundle(Bundle bundle, MallIdParser.Selection selection, int depth) {
++        if (bundle == null || depth > 3) return;
+         bundle.setClassLoader(qqLoader);
++        int scanned = 0;
+         for (String key : bundle.keySet()) {
++            if (++scanned > 64) break;
+             Object value;
+-            try {
+-                value = bundle.get(key);
+-            } catch (Throwable ignored) {
+-                continue;
+-            }
+-            if (value instanceof Bundle) {
+-                int nested = findIdInBundle((Bundle) value, depth + 1);
+-                if (nested > 0) return nested;
+-            }
+-            String lower = key == null ? "" : key.toLowerCase();
+-            if (lower.equals("itemid") || lower.equals("item_id") || lower.equals("kr_turbo_display")) {
+-                int direct = directId(String.valueOf(value));
+-                if (direct > 0) return direct;
+-            }
+-            int parsed = parseMarker(String.valueOf(value));
+-            if (parsed > 0) return parsed;
+-        }
+-        return 0;
+-    }
+-
+-    private static int parseMarker(String input) {
+-        if (input == null || "null".equals(input)) return 0;
+-        String decoded = input;
+-        try {
+-            decoded = Uri.decode(Uri.decode(decoded));
+-        } catch (Throwable ignored) {
+-        }
+-        Matcher matcher = BUBBLE_MARKER.matcher(decoded);
+-        return matcher.find() ? Reflector.positiveInt(matcher.group(1)) : 0;
+-    }
+-
+-    private static int directId(String input) {
+-        if (input == null) return 0;
+-        String value = input.trim();
+-        if (value.startsWith("2_")) value = value.substring(2);
+-        Matcher digits = Pattern.compile("([0-9]{4,10})").matcher(value);
+-        return digits.find() ? Reflector.positiveInt(digits.group(1)) : 0;
++            try { value = bundle.get(key); } catch (Throwable ignored) { continue; }
++            if (value instanceof Bundle) collectMallBundle((Bundle) value, selection, depth + 1);
++            else if (value instanceof CharSequence || value instanceof Uri) {
++                if (MallIdParser.isItemKey(key)) {
++                    MallIdParser.collectValue(key, value.toString(), selection);
++                } else MallIdParser.collect(value.toString(), selection);
++            }
++        }
+     }
+ 
+     private static Method findNoArgMethod(Class<?> type, String name) {
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/ConfigCodec.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/ConfigCodec.java
+@@ -5,7 +5,9 @@
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Set;
+-import java.util.regex.Matcher;
++import org.json.JSONArray;
++import org.json.JSONObject;
++import org.json.JSONTokener;
+ import java.util.regex.Pattern;
+ 
+ /** Stable, permission-free text format used by the in-QQ import/export surface. */
+@@ -21,7 +23,7 @@
+         StringBuilder output = new StringBuilder(256);
+         output.append("{\n")
+                 .append("  \"format\": \"bianbian-bubble-config\",\n")
+-                .append("  \"version\": \"3.6\",\n")
++                .append("  \"version\": \"3.7\",\n")
+                 .append("  \"name\": \"").append(escape(safeName(name))).append("\",\n")
+                 .append("  \"mode\": \"").append(mode).append("\",\n")
+                 .append("  \"randomEnabled\": ").append(randomEnabled).append(",\n")
+@@ -54,48 +56,99 @@
+     }
+ 
+     private static DecodedConfig decodeObject(String text) {
+-        if (!text.endsWith("}")) throw new IllegalArgumentException("配置 JSON 没有正确结束");
+-        String format = stringField(text, "format");
+-        if (format != null && !"bianbian-bubble-config".equals(format)) {
+-            throw new IllegalArgumentException("不是百变气泡配置");
+-        }
+-        String name = safeName(stringField(text, "name"));
+-        String mode = stringField(text, "mode");
+-        Boolean randomValue = booleanField(text, "randomEnabled");
+-        Boolean lockedValue = booleanField(text, "lockedEnabled");
+-        Boolean antiRevokeValue = booleanField(text, "antiRevokeEnabled");
+-        boolean random = randomValue != null && randomValue;
+-        boolean locked = lockedValue != null && lockedValue;
+-        boolean antiRevoke = antiRevokeValue != null && antiRevokeValue;
+-        if (mode != null) {
+-            String normalized = mode.trim().toLowerCase(Locale.ROOT);
+-            if ("random".equals(normalized)) {
+-                random = true;
+-                locked = false;
+-            } else if ("independent".equals(normalized) || "fixed".equals(normalized)) {
+-                random = false;
+-                locked = true;
+-            } else if ("off".equals(normalized)) {
+-                random = false;
+-                locked = false;
+-            } else {
+-                throw new IllegalArgumentException("不支持的模式：" + mode);
+-            }
+-        }
+-        if (random && locked) throw new IllegalArgumentException("随机模式和独立模式不能同时开启");
+-
+-        Integer lockedValueId = integerField(text, "lockedId");
+-        int lockedId = lockedValueId == null || lockedValueId == 0
+-                ? 0 : checkedId(lockedValueId.toString());
+-        String poolBody = arrayField(text, "pool");
+-        List<Integer> ids = poolBody == null ? new ArrayList<>() : parseArray(poolBody);
+-        if (locked) {
+-            if (lockedId <= 0) throw new IllegalArgumentException("独立模式缺少有效的 lockedId");
+-            if (!ids.contains(lockedId)) ids.add(0, lockedId);
+-        }
+-        if (random && ids.isEmpty()) throw new IllegalArgumentException("随机模式的气泡池不能为空");
+-        if (ids.size() > MAX_IDS) throw new IllegalArgumentException("气泡 ID 不能超过 " + MAX_IDS + " 个");
+-        return new DecodedConfig(name, random, locked, antiRevoke, lockedId, ids);
++        try {
++            checkNesting(text);
++            JSONTokener tokenizer = new JSONTokener(text);
++            Object parsed = tokenizer.nextValue();
++            if (!(parsed instanceof JSONObject) || tokenizer.nextClean() != 0) throw new IllegalArgumentException("配置 JSON 格式错误");
++            JSONObject object = (JSONObject) parsed;
++            String format = jsonString(object, "format");
++            if (format != null && !"bianbian-bubble-config".equals(format)) throw new IllegalArgumentException("不是百变气泡配置");
++            if (!object.has("mode") && !object.has("randomEnabled") && !object.has("lockedEnabled")) {
++                throw new IllegalArgumentException("配置缺少模式字段；仅导入 ID 请使用数组或 ID 列表");
++            }
++            String name = safeName(jsonString(object, "name"));
++            String mode = jsonString(object, "mode");
++            boolean random = jsonBoolean(object, "randomEnabled");
++            boolean locked = jsonBoolean(object, "lockedEnabled");
++            boolean anti = jsonBoolean(object, "antiRevokeEnabled");
++            if (mode != null) {
++                switch (mode.trim().toLowerCase(Locale.ROOT)) {
++                    case "random": random = true; locked = false; break;
++                    case "independent": case "fixed": random = false; locked = true; break;
++                    case "off": random = false; locked = false; break;
++                    default: throw new IllegalArgumentException("不支持的模式：" + mode);
++                }
++            }
++            if (random && locked) throw new IllegalArgumentException("随机模式和独立模式不能同时开启");
++            int lockedId = 0;
++            if (object.has("lockedId")) {
++                Object raw = object.get("lockedId");
++                if (!(raw instanceof Number) || raw instanceof Double || raw instanceof Float) throw new IllegalArgumentException("lockedId 必须是整数");
++                long number = ((Number) raw).longValue();
++                if (number != 0) lockedId = checkedId(String.valueOf(number));
++            }
++            if (!object.has("pool") && !locked) throw new IllegalArgumentException("配置缺少气泡池");
++            List<Integer> ids = new ArrayList<>();
++            if (object.has("pool")) {
++                Object raw = object.get("pool");
++                if (!(raw instanceof JSONArray)) throw new IllegalArgumentException("pool 必须是气泡 ID 数组");
++                JSONArray pool = (JSONArray) raw;
++                for (int i = 0; i < pool.length(); i++) {
++                    Object id = pool.get(i);
++                    if (!(id instanceof String) && !(id instanceof Number) || id instanceof Double || id instanceof Float) {
++                        throw new IllegalArgumentException("气泡 ID 必须是整数");
++                    }
++                    addUnique(ids, checkedId(String.valueOf(id)));
++                }
++            }
++            if (locked) {
++                if (lockedId <= 0) throw new IllegalArgumentException("独立模式缺少有效的 lockedId");
++                if (!ids.contains(lockedId)) ids.add(0, lockedId);
++            }
++            if (random && ids.isEmpty()) throw new IllegalArgumentException("随机模式的气泡池不能为空");
++            if (ids.size() > MAX_IDS) throw new IllegalArgumentException("气泡 ID 不能超过 " + MAX_IDS + " 个");
++            return new DecodedConfig(name, random, locked, anti, lockedId, ids, object.has("antiRevokeEnabled"));
++        } catch (IllegalArgumentException error) { throw error; }
++        catch (Exception error) { throw new IllegalArgumentException("配置 JSON 格式错误", error); }
++    }
++
++    private static void checkNesting(String text) {
++        int depth = 0;
++        boolean quoted = false;
++        boolean escaped = false;
++        for (int i = 0; i < text.length(); i++) {
++            char value = text.charAt(i);
++            if (quoted) {
++                if (escaped) escaped = false;
++                else if (value == '\\') escaped = true;
++                else if (value == '"') quoted = false;
++                continue;
++            }
++            if (value == '"') quoted = true;
++            else if (value == '{' || value == '[') {
++                if (++depth > 16) throw new IllegalArgumentException("配置嵌套过深");
++            } else if (value == '}' || value == ']') {
++                if (--depth < 0) throw new IllegalArgumentException("配置 JSON 格式错误");
++            } else if (value == '\'' || value == '#' || value == '/') {
++                throw new IllegalArgumentException("配置 JSON 不接受单引号或注释");
++            }
++        }
++        if (quoted || depth != 0) throw new IllegalArgumentException("配置 JSON 没有正确结束");
++    }
++
++    private static String jsonString(JSONObject object, String key) throws Exception {
++        if (!object.has(key)) return null;
++        Object value = object.get(key);
++        if (!(value instanceof String)) throw new IllegalArgumentException(key + " 必须是文本");
++        return (String) value;
++    }
++
++    private static boolean jsonBoolean(JSONObject object, String key) throws Exception {
++        if (!object.has(key)) return false;
++        Object value = object.get(key);
++        if (!(value instanceof Boolean)) throw new IllegalArgumentException(key + " 必须是 true 或 false");
++        return (Boolean) value;
+     }
+ 
+     private static List<Integer> parseArray(String body) {
+@@ -116,7 +169,8 @@
+ 
+     private static List<Integer> parseLooseList(String text) {
+         List<Integer> result = new ArrayList<>();
+-        String[] parts = text.split("[^0-9]+");
++        if (!text.matches("[0-9,，;；\\s]+")) throw new IllegalArgumentException("ID 列表含无效字符");
++        String[] parts = text.split("[,，;；\\s]+");
+         for (String part : parts) {
+             if (part.isEmpty()) continue;
+             addUnique(result, checkedId(part));
+@@ -131,7 +185,7 @@
+         }
+         try {
+             int id = Integer.parseInt(token);
+-            if (id <= 0) throw new NumberFormatException("non-positive");
++            if (id < 1000) throw new NumberFormatException("below minimum bubble id");
+             return id;
+         } catch (NumberFormatException error) {
+             throw new IllegalArgumentException("气泡 ID 超出范围：" + token);
+@@ -146,38 +200,10 @@
+     private static List<Integer> uniqueIds(List<Integer> source) {
+         Set<Integer> unique = new LinkedHashSet<>();
+         if (source != null) {
+-            for (Integer id : source) if (id != null && id > 0) unique.add(id);
+-        }
++            for (Integer id : source) if (id != null && id >= 1000) unique.add(id);
++        }
++        if (unique.size() > MAX_IDS) throw new IllegalArgumentException("气泡 ID 不能超过 " + MAX_IDS + " 个");
+         return new ArrayList<>(unique);
+-    }
+-
+-    private static Boolean booleanField(String json, String key) {
+-        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(key)
+-                + "\\\"\\s*:\\s*(true|false)", Pattern.CASE_INSENSITIVE).matcher(json);
+-        return matcher.find() ? Boolean.valueOf(matcher.group(1)) : null;
+-    }
+-
+-    private static Integer integerField(String json, String key) {
+-        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(key)
+-                + "\\\"\\s*:\\s*([0-9]{1,10})").matcher(json);
+-        if (!matcher.find()) return null;
+-        try {
+-            return Integer.valueOf(matcher.group(1));
+-        } catch (NumberFormatException error) {
+-            throw new IllegalArgumentException("数值超出范围：" + key);
+-        }
+-    }
+-
+-    private static String arrayField(String json, String key) {
+-        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(key)
+-                + "\\\"\\s*:\\s*\\[([^\\]]*)\\]", Pattern.DOTALL).matcher(json);
+-        return matcher.find() ? matcher.group(1) : null;
+-    }
+-
+-    private static String stringField(String json, String key) {
+-        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(key)
+-                + "\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"\\\\])*)\\\"", Pattern.DOTALL).matcher(json);
+-        return matcher.find() ? unescape(matcher.group(1)) : null;
+     }
+ 
+     private static String safeName(String name) {
+@@ -187,31 +213,8 @@
+     }
+ 
+     private static String escape(String value) {
+-        return value.replace("\\", "\\\\").replace("\"", "\\\"")
+-                .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+-    }
+-
+-    private static String unescape(String value) {
+-        StringBuilder result = new StringBuilder(value.length());
+-        boolean escaped = false;
+-        for (int i = 0; i < value.length(); i++) {
+-            char c = value.charAt(i);
+-            if (!escaped && c == '\\') {
+-                escaped = true;
+-                continue;
+-            }
+-            if (escaped) {
+-                if (c == 'n') result.append('\n');
+-                else if (c == 'r') result.append('\r');
+-                else if (c == 't') result.append('\t');
+-                else result.append(c);
+-                escaped = false;
+-            } else {
+-                result.append(c);
+-            }
+-        }
+-        if (escaped) result.append('\\');
+-        return result.toString();
++        String quoted = JSONObject.quote(value);
++        return quoted.substring(1, quoted.length() - 1);
+     }
+ 
+     static final class DecodedConfig {
+@@ -219,15 +222,22 @@
+         final boolean randomEnabled;
+         final boolean lockedEnabled;
+         final boolean antiRevokeEnabled;
++        final boolean hasAntiRevokeSetting;
+         final int lockedId;
+         final List<Integer> ids;
+ 
+         DecodedConfig(String name, boolean randomEnabled, boolean lockedEnabled,
+                       boolean antiRevokeEnabled, int lockedId, List<Integer> ids) {
++            this(name, randomEnabled, lockedEnabled, antiRevokeEnabled, lockedId, ids, false);
++        }
++
++        DecodedConfig(String name, boolean randomEnabled, boolean lockedEnabled,
++                      boolean antiRevokeEnabled, int lockedId, List<Integer> ids, boolean hasAntiRevokeSetting) {
+             this.name = safeName(name);
+             this.randomEnabled = randomEnabled;
+             this.lockedEnabled = lockedEnabled;
+             this.antiRevokeEnabled = antiRevokeEnabled;
++            this.hasAntiRevokeSetting = hasAntiRevokeSetting;
+             this.lockedId = lockedId;
+             this.ids = uniqueIds(ids);
+         }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/ConfigUi.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/ConfigUi.java
+@@ -0,0 +1,37 @@
++package com.qiutian.bianpaobubble.hook;
++
++import android.app.Activity;
++import android.os.Bundle;
++import android.widget.Toast;
++import java.util.concurrent.Callable;
++
++/** Success feedback follows a confirmed disk write; a failure restores the visible state. */
++final class ConfigUi {
++    interface Refresh { void update(Bundle state); }
++    private ConfigUi() {}
++    static void write(Activity activity, Callable<Bundle> operation, String message, Refresh refresh) {
++        long generation = HostConfig.generation();
++        HostConfig.runAsync(() -> {
++            Bundle result;
++            try { result = operation.call(); }
++            catch (Exception error) {
++                result = new Bundle();
++                result.putString("_error", String.valueOf(error.getMessage()));
++                HookLog.error(activity, "配置保存失败", error);
++            }
++            boolean saved = HostConfig.success(result);
++            String error = result == null ? "无返回结果" : result.getString("_error", "存储不可用");
++            if (!saved) HookLog.error(activity, "配置保存失败", new IllegalStateException(error));
++            activity.runOnUiThread(() -> {
++                if (activity.isFinishing() || activity.isDestroyed()) return;
++                if (generation != HostConfig.generation()) {
++                    if (!saved) Toast.makeText(activity, "一项设置保存失败，请重新打开设置确认", Toast.LENGTH_LONG).show();
++                    return;
++                }
++                if (!saved && refresh != null) refresh.update(HostConfig.get(activity));
++                String notice = saved ? message : "保存失败，已恢复已保存配置：" + error;
++                if (notice != null && !notice.isEmpty()) Toast.makeText(activity, notice, Toast.LENGTH_SHORT).show();
++            });
++        });
++    }
++}
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/HookLog.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/HookLog.java
+@@ -3,12 +3,13 @@
+ import android.content.Context;
+ 
+ import java.util.Map;
+-import java.util.concurrent.ConcurrentHashMap;
++import java.util.LinkedHashMap;
++import android.os.SystemClock;
+ 
+ import de.robv.android.xposed.XposedBridge;
+ 
+ final class HookLog {
+-    private static final Map<String, Long> RECENT = new ConcurrentHashMap<>();
++    private static final Map<String, Long> RECENT = new LinkedHashMap<>();
+ 
+     private HookLog() {}
+ 
+@@ -27,9 +28,14 @@
+         }
+         String message = "[" + code + "] " + where + " | " + type
+                 + (detail.isEmpty() ? "" : ": " + detail) + trace;
+-        long now = System.currentTimeMillis();
+-        Long previous = RECENT.put(message, now);
+-        if (previous != null && now - previous < 60_000L) return;
++        if (message.length() > 1200) message = message.substring(0, 1200);
++        long now = SystemClock.elapsedRealtime();
++        synchronized (RECENT) {
++            Long previous = RECENT.get(message);
++            if (previous != null && now - previous < 60_000L) return;
++            RECENT.put(message, now);
++            while (RECENT.size() > 128) RECENT.remove(RECENT.keySet().iterator().next());
++        }
+         XposedBridge.log("百变气泡 | " + message);
+         if (context != null) HostConfig.appendLog(context, message);
+     }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/HookStatus.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/HookStatus.java
+@@ -0,0 +1,33 @@
++package com.qiutian.bianpaobubble.hook;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/** In-process hook evidence, separate from a possibly delayed provider heartbeat. */
++final class HookStatus {
++    private static final Map<String, String> FEATURES = new LinkedHashMap<>();
++    private static volatile boolean initialized;
++    private HookStatus() {}
++    static void started() { initialized = true; }
++    static boolean active() { return initialized; }
++    static synchronized void installed(String name) { FEATURES.put(name, "已挂载（待触发验证）"); }
++    static synchronized void seen(String name) { FEATURES.put(name, "已触发"); }
++    static synchronized void failed(String name, Throwable error) {
++        FEATURES.put(name, "未挂载：" + error.getClass().getSimpleName());
++    }
++    static synchronized boolean available(String name) {
++        String state = FEATURES.get(name);
++        return state != null && state.startsWith("已");
++    }
++    static boolean requiredReady(boolean anti) {
++        return active() && available("发送气泡") && available("长按菜单") && available("商城识别")
++                && (!anti || available("防撤回"));
++    }
++    static synchronized String describe() {
++        StringBuilder result = new StringBuilder();
++        for (String name : new String[]{"发送气泡", "长按菜单", "商城识别", "防撤回"}) {
++            result.append(name).append(" Hook：").append(FEATURES.containsKey(name) ? FEATURES.get(name) : "尚未初始化").append('\n');
++        }
++        return result.toString();
++    }
++}
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/HostConfig.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/HostConfig.java
+@@ -4,442 +4,264 @@
+ import android.content.SharedPreferences;
+ import android.net.Uri;
+ import android.os.Bundle;
+-
++import android.os.SystemClock;
+ import com.qiutian.bianpaobubble.AppConfig;
+-
+-import java.text.SimpleDateFormat;
+-import java.util.ArrayList;
+-import java.util.Date;
+-import java.util.List;
+-import java.util.Locale;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.ScheduledExecutorService;
++import com.qiutian.bianpaobubble.ConfigStore;
++import java.util.concurrent.ScheduledThreadPoolExecutor;
+ import java.util.concurrent.ScheduledFuture;
+ import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
++/** Durable local state with asynchronous IPC and bounded recovery for isolated loaders. */
+ final class HostConfig {
+     private static final long CACHE_MAX_AGE_MS = 20_000L;
+     private static final Uri URI = Uri.parse("content://" + AppConfig.AUTHORITY);
++    private static final String HOST_CONFIG_PREFS = "bianbian_bubble_host_config_v36";
+     private static final String HOST_NOTICE_PREFS = "bianbian_bubble_host_notice";
+-    private static final String HOST_CONFIG_PREFS = "bianbian_bubble_host_config_v36";
++    private static final Object IO = new Object();
++    private static final Object STATE = new Object();
+     private static volatile Bundle cache = Bundle.EMPTY;
+-    private static volatile long cacheTime;
++    private static volatile long sourceReadAt = -1L;
++    private static volatile long nextProviderProbe;
+     private static volatile long lastHookReportTime;
+-    private static final ScheduledExecutorService WRITES = Executors.newSingleThreadScheduledExecutor(runnable -> {
+-        Thread thread = new Thread(runnable, "BianBianBubble-Config");
+-        thread.setDaemon(true);
+-        return thread;
++    private static volatile String providerError = "";
++    private static volatile boolean providerAvailable;
++    private static int providerFailures;
++    private static final AtomicBoolean REFRESHING = new AtomicBoolean();
++    private static final AtomicLong GENERATION = new AtomicLong();
++    private static final ThreadLocal<Long> WRITE_GENERATION = new ThreadLocal<>();
++    private static final AtomicReference<ScheduledFuture<?>> APPLIED_WRITE = new AtomicReference<>();
++    private static final ScheduledThreadPoolExecutor WRITES = new ScheduledThreadPoolExecutor(1, task -> {
++        Thread t = new Thread(task, "BianBianBubble-Config"); t.setDaemon(true); return t;
+     });
+-    private static final AtomicInteger APPLIED_GENERATION = new AtomicInteger();
+-    private static final AtomicReference<ScheduledFuture<?>> APPLIED_WRITE = new AtomicReference<>();
+-
++    static { WRITES.setRemoveOnCancelPolicy(true); }
+     private HostConfig() {}
+ 
++    private static Context app(Context context) {
++        if (context == null) return null;
++        Context result = context.getApplicationContext();
++        return result == null ? context : result;
++    }
++    private static SharedPreferences prefs(Context context) {
++        return context.getSharedPreferences(HOST_CONFIG_PREFS, Context.MODE_PRIVATE);
++    }
++    static boolean success(Bundle value) {
++        return value != null && value.getBoolean("_ok", false) && !value.getBoolean("_authDenied", false)
++                && !value.containsKey("_error") && value.getIntArray("pool") != null;
++    }
++    private static boolean configuration(Bundle value) {
++        return success(value) && value.containsKey("masterEnabled") && value.containsKey("randomEnabled")
++                && value.containsKey("lockedEnabled") && value.containsKey("lockedId");
++    }
++    private static Bundle copy(Bundle value) {
++        Bundle result = new Bundle(value);
++        int[] pool = value.getIntArray("pool");
++        if (pool != null) result.putIntArray("pool", pool.clone());
++        return result;
++    }
++    private static void accept(Bundle value, long generation, boolean sourceRead) {
++        if (!configuration(value)) return;
++        synchronized (STATE) {
++            if (generation != GENERATION.get()) return;
++            Bundle next = AppConfig.normalize(value);
++            // A configuration refresh must not rewind a send that occurred during IPC.
++            if (next.getBoolean("masterEnabled", false) && cache.containsKey("lastAppliedId")) {
++                next.putInt("lastAppliedId", cache.getInt("lastAppliedId", 0));
++            }
++            cache = next;
++            if (sourceRead) sourceReadAt = SystemClock.elapsedRealtime();
++        }
++    }
++
++    /** Hot-path reads never synchronously enter the module provider. */
+     static Bundle get(Context context) {
+-        long now = System.currentTimeMillis();
+-        if (cacheTime > 0L && now - cacheTime < CACHE_MAX_AGE_MS && cache != null) return cache;
+-        Bundle previous = cache;
++        Context host = app(context);
++        if (!configuration(cache) && host != null) {
++            long generation = GENERATION.get();
++            // Do not wait for the IPC lock even on the first outgoing message.
++            Bundle local = ConfigStore.call(prefs(host), "getConfig", null, true);
++            synchronized (STATE) {
++                if (!configuration(cache)) accept(channel(local), generation, false);
++            }
++        }
++        if (host != null && (sourceReadAt < 0 || SystemClock.elapsedRealtime() - sourceReadAt >= CACHE_MAX_AGE_MS)) requestRefresh(host);
++        return configuration(cache) ? copy(cache) : Bundle.EMPTY;
++    }
++    static Bundle getForSend(Context context) { return get(context); }
++
++    private static void requestRefresh(Context context) {
++        if (!REFRESHING.compareAndSet(false, true)) return;
++        runAsync(() -> { try { refresh(context); } finally { REFRESHING.set(false); } });
++    }
++    static Bundle refresh(Context context) {
++        Context host = app(context);
++        if (host == null) return Bundle.EMPTY;
++        long generation = operationGeneration();
++        synchronized (IO) {
++            Bundle local = ConfigStore.call(prefs(host), "getConfig", null, true);
++            Bundle latest = synchronize(host, local, false);
++            accept(latest, generation, true);
++            if (!configuration(latest)) sourceReadAt = SystemClock.elapsedRealtime();
++            return configuration(cache) ? copy(cache) : latest;
++        }
++    }
++
++    private static Bundle synchronize(Context host, Bundle local, boolean force) {
++        if (!configuration(local)) return local;
++        if (!force && SystemClock.elapsedRealtime() < nextProviderProbe) return channel(local);
+         try {
+-            Bundle value = resolverCall(context, "getConfig", null, 2);
+-            if (usable(value)) {
+-                value.setClassLoader(HostConfig.class.getClassLoader());
+-                updateCache(value);
+-            }
+-        } catch (Throwable e) {
+-            HookLog.error(context, "读取配置失败", e);
+-        }
+-        if ((cache == null || cache == Bundle.EMPTY) && previous != null) cache = previous;
+-        return cache == null ? Bundle.EMPTY : cache;
+-    }
+-
+-    /**
+-     * Returns a periodically refreshed and logically normalized configuration for
+-     * the outgoing-message Hook. A valid random/locked mode must keep the master
+-     * state enabled; this repairs the long-running state where toggling the switch
+-     * once temporarily made bubbles work again.
+-     */
+-    static Bundle getForSend(Context context) {
+-        Bundle current = get(context);
+-        if (current == null || current == Bundle.EMPTY) return Bundle.EMPTY;
+-        boolean locked = current.getBoolean("lockedEnabled", false)
+-                && current.getInt("lockedId", 0) >= 1000;
+-        int[] pool = current.getIntArray("pool");
+-        boolean random = !locked && current.getBoolean("randomEnabled", false)
+-                && pool != null && pool.length > 0;
+-        boolean master = locked || random;
+-        boolean inconsistent = current.getBoolean("masterEnabled", false) != master
+-                || current.getBoolean("lockedEnabled", false) != locked
+-                || current.getBoolean("randomEnabled", false) != random;
+-        if (!inconsistent) return current;
+-
+-        Bundle repaired = new Bundle(current);
+-        repaired.putBoolean("masterEnabled", master);
+-        repaired.putBoolean("lockedEnabled", locked);
+-        repaired.putBoolean("randomEnabled", random);
+-        updateCache(repaired);
+-        int lockedId = locked ? repaired.getInt("lockedId", 0) : 0;
+-        runAsync(() -> saveSettings(context, master, random, locked, lockedId,
+-                pool == null ? new int[0] : pool));
+-        appendLog(context, "气泡模式状态已自动修复 | master=" + master
+-                + ", random=" + random + ", locked=" + locked);
+-        return repaired;
+-    }
+-
+-    static Bundle refresh(Context context) {
+-        cacheTime = 0L;
+-        return get(context);
+-    }
+-
++            boolean dirty = local.getBoolean("_pendingSync", false);
++            // Replay durable local changes before accepting any older remote snapshot.
++            Bundle remote = host.getContentResolver().call(URI, dirty ? "saveSettings" : "getConfig", null, dirty ? local : null);
++            if (!configuration(remote)) throw new IllegalStateException(remote == null ? "Provider 无返回" : remote.getString("_error", "Provider 配置不可用"));
++            if (!dirty && local.getLong("settingsRevision", 0L) > remote.getLong("settingsRevision", 0L)) {
++                remote = host.getContentResolver().call(URI, "saveSettings", null, local);
++                if (!configuration(remote)) throw new IllegalStateException("较新的本地配置尚未同步");
++                dirty = true;
++            }
++            if (!ConfigStore.mirror(prefs(host), remote, dirty, local.getLong("settingsRevision", 0L))) {
++                throw new IllegalStateException("本地配置已更新或镜像写入失败，待同步设置已保留");
++            }
++            providerAvailable = true; providerError = ""; providerFailures = 0; nextProviderProbe = 0L;
++            return channel(ConfigStore.call(prefs(host), "getConfig", null, true));
++        } catch (Throwable error) {
++            providerAvailable = false;
++            providerError = error.getClass().getSimpleName() + ": " + String.valueOf(error.getMessage());
++            providerFailures = Math.min(4, providerFailures + 1);
++            nextProviderProbe = SystemClock.elapsedRealtime() + Math.min(300_000L, 30_000L << (providerFailures - 1));
++            Bundle latest = ConfigStore.call(prefs(host), "getConfig", null, true);
++            return channel(configuration(latest) ? latest : local);
++        }
++    }
++    private static Bundle channel(Bundle value) {
++        Bundle result = copy(value);
++        result.putBoolean("_configFallback", !providerAvailable);
++        result.putString("_configChannel", providerAvailable ? "QQ 本地存储（已同步 Provider）" : "QQ 本地兼容存储");
++        if (!providerError.isEmpty()) result.putString("_providerError", providerError);
++        return result;
++    }
++    static long generation() { return GENERATION.get(); }
++    static long reserveWrite() { synchronized (STATE) { return GENERATION.incrementAndGet(); } }
++
++    private static long operationGeneration() {
++        Long captured = WRITE_GENERATION.get();
++        return captured == null ? GENERATION.get() : captured;
++    }
++    private static Bundle mutate(Context context, String method, Bundle extras) {
++        Context host = app(context);
++        if (host == null) return Bundle.EMPTY;
++        long generation = operationGeneration();
++        synchronized (IO) {
++            Bundle result = ConfigStore.call(prefs(host), method, extras, true);
++            if (configuration(result)) {
++                accept(channel(result), generation, false);
++                requestRefresh(host);
++            } else {
++                accept(channel(ConfigStore.call(prefs(host), "getConfig", null, true)), generation, false);
++            }
++            return result;
++        }
++    }
+     static Bundle call(Context context, String method, int id) {
+-        try {
+-            Bundle extras = new Bundle();
+-            extras.putInt("id", id);
+-            Bundle result = resolverCall(context, method, extras, 2);
+-            return acceptResult(result);
+-        } catch (Throwable e) {
+-            HookLog.error(context, "写入配置失败：" + method, e);
+-            return Bundle.EMPTY;
+-        }
+-    }
+-
+-    static Bundle saveSettings(Context context, boolean masterEnabled, boolean randomEnabled,
+-                               boolean lockedEnabled, int lockedId, int[] pool) {
+-        return writeSettings(context, masterEnabled, randomEnabled, lockedEnabled,
+-                null, lockedId, pool);
+-    }
+-
+-    static Bundle importSettings(Context context, boolean masterEnabled, boolean randomEnabled,
+-                                 boolean lockedEnabled, boolean antiRevokeEnabled,
+-                                 int lockedId, int[] pool) {
+-        return writeSettings(context, masterEnabled, randomEnabled, lockedEnabled,
+-                antiRevokeEnabled, lockedId, pool);
+-    }
+-
+-    private static Bundle writeSettings(Context context, boolean masterEnabled, boolean randomEnabled,
+-                                        boolean lockedEnabled, Boolean antiRevokeEnabled,
+-                                        int lockedId, int[] pool) {
+-        try {
+-            Bundle extras = new Bundle();
+-            extras.putBoolean("masterEnabled", masterEnabled);
+-            extras.putBoolean("randomEnabled", randomEnabled);
+-            extras.putBoolean("lockedEnabled", lockedEnabled);
+-            extras.putInt("lockedId", lockedId);
+-            extras.putIntArray("pool", pool);
+-            if (antiRevokeEnabled != null) extras.putBoolean("antiRevokeEnabled", antiRevokeEnabled);
+-            Bundle result = resolverCall(context, "saveSettings", extras, 3);
+-            return acceptResult(result);
+-        } catch (Throwable e) {
+-            HookLog.error(context, "保存内置设置失败", e);
+-            return Bundle.EMPTY;
+-        }
+-    }
+-
+-    static Bundle call(Context context, String method) {
+-        try {
+-            Bundle result = resolverCall(context, method, null, 2);
+-            return acceptResult(result);
+-        } catch (Throwable e) {
+-            HookLog.error(context, "执行设置操作失败：" + method, e);
+-            return Bundle.EMPTY;
+-        }
+-    }
+-
++        Bundle extras = new Bundle(); extras.putInt("id", id); return mutate(context, method, extras);
++    }
++    static Bundle call(Context context, String method) { return mutate(context, method, null); }
++    static Bundle saveSettings(Context context, boolean master, boolean random, boolean locked, int id, int[] pool) {
++        return writeSettings(context, master, random, locked, null, id, pool);
++    }
++    static Bundle importSettings(Context context, boolean master, boolean random, boolean locked, Boolean anti, int id, int[] pool) {
++        return writeSettings(context, master, random, locked, anti, id, pool);
++    }
++    private static Bundle writeSettings(Context context, boolean master, boolean random, boolean locked, Boolean anti, int id, int[] pool) {
++        Bundle b = new Bundle(); b.putBoolean("masterEnabled", master); b.putBoolean("randomEnabled", random);
++        b.putBoolean("lockedEnabled", locked); b.putInt("lockedId", id); b.putIntArray("pool", pool == null ? new int[0] : pool.clone());
++        if (anti != null) b.putBoolean("antiRevokeEnabled", anti);
++        return mutate(context, "saveSettings", b);
++    }
+     static Bundle saveAntiRevoke(Context context, boolean enabled) {
+-        try {
+-            Bundle extras = new Bundle();
+-            extras.putBoolean("enabled", enabled);
+-            Bundle result = resolverCall(context, "setAntiRevoke", extras, 3);
+-            return acceptResult(result);
+-        } catch (Throwable e) {
+-            HookLog.error(context, "保存防撤回设置失败", e);
+-            return Bundle.EMPTY;
+-        }
+-    }
+-
++        Bundle extras = new Bundle(); extras.putBoolean("enabled", enabled); return mutate(context, "setAntiRevoke", extras);
++    }
++    static void stageSettings(boolean master, boolean random, boolean locked, int id, int[] pool) {
++        synchronized (STATE) {
++        GENERATION.incrementAndGet();
++        Bundle staged = new Bundle(cache);
++        staged.putBoolean("masterEnabled", master); staged.putBoolean("randomEnabled", random);
++        staged.putBoolean("lockedEnabled", locked); staged.putInt("lockedId", id);
++        staged.putIntArray("pool", pool == null ? new int[0] : pool.clone()); staged.putBoolean("_ok", true);
++        cache = AppConfig.normalize(staged);
++        }
++    }
+     static void stageAntiRevoke(boolean enabled) {
+-        Bundle staged = cache == null || cache == Bundle.EMPTY ? new Bundle() : new Bundle(cache);
+-        staged.putBoolean("antiRevokeEnabled", enabled);
+-        updateCache(staged);
+-    }
+-
++        synchronized (STATE) {
++        GENERATION.incrementAndGet();
++        Bundle staged = new Bundle(cache); staged.putBoolean("antiRevokeEnabled", enabled); cache = staged;
++        }
++    }
++    static void runAsync(Runnable task) {
++        long generation = GENERATION.get();
++        WRITES.execute(() -> {
++            WRITE_GENERATION.set(generation);
++            try { task.run(); }
++            catch (Throwable error) { HookLog.info("后台操作失败：" + error.getClass().getSimpleName()); }
++            finally { WRITE_GENERATION.remove(); }
++        });
++    }
++    static void noteApplied(Context context, int id) {
++        if (!AppConfig.validId(id)) return;
++        Context host = app(context); if (host == null) return;
++        synchronized (STATE) {
++            if (!cache.getBoolean("masterEnabled", false)) return;
++            Bundle staged = new Bundle(cache); staged.putInt("lastAppliedId", id); cache = staged;
++        }
++        // Runtime statistics do not extend the lifetime of the source configuration.
++        ScheduledFuture<?> next = WRITES.schedule(() -> {
++            Bundle extra = new Bundle(); extra.putInt("id", id);
++            ConfigStore.call(prefs(host), "recordApplied", extra, true);
++        }, 900L, TimeUnit.MILLISECONDS);
++        ScheduledFuture<?> old = APPLIED_WRITE.getAndSet(next); if (old != null) old.cancel(false);
++    }
++    static void reportHook(Context context, String version) {
++        long now = SystemClock.elapsedRealtime();
++        if (lastHookReportTime > 0L && now - lastHookReportTime < 60_000L) return;
++        lastHookReportTime = now;
++        Context host = app(context); if (host == null) return;
++        runAsync(() -> {
++            Bundle extra = new Bundle(); extra.putString("version", version == null ? "" : version);
++            synchronized (IO) {
++                Bundle local = ConfigStore.call(prefs(host), "reportHook", extra, true);
++                accept(synchronize(host, local, false), operationGeneration(), true);
++                if (providerAvailable) {
++                    try { host.getContentResolver().call(URI, "reportHook", null, extra); }
++                    catch (Throwable ignored) {}
++                }
++            }
++        });
++    }
++    static void appendLog(Context context, String message) {
++        Context host = app(context); if (host == null) return;
++        runAsync(() -> {
++            Bundle extra = new Bundle(); extra.putString("message", message);
++            ConfigStore.call(prefs(host), "appendLog", extra, true);
++        });
++    }
+     static boolean isNoticeAcceptedV135(Context context) {
+         if (get(context).getBoolean(AppConfig.QQ_NOTICE_V135, false)) return true;
+-        try {
+-            return context.getSharedPreferences(HOST_NOTICE_PREFS, Context.MODE_PRIVATE)
+-                    .getBoolean(AppConfig.QQ_NOTICE_V135, false);
+-        } catch (Throwable ignored) {
+-            return false;
+-        }
+-    }
+-
+-    /** Persists the one-time notice in both the module provider and QQ host as an FPA-safe fallback. */
+-    static boolean acceptNoticeV135(Context context) {
+-        Bundle staged = cache == null || cache == Bundle.EMPTY ? new Bundle() : new Bundle(cache);
+-        staged.putBoolean(AppConfig.QQ_NOTICE_V135, true);
+-        updateCache(staged);
+-        boolean hostSaved = false;
+-        try {
+-            SharedPreferences host = context.getSharedPreferences(HOST_NOTICE_PREFS, Context.MODE_PRIVATE);
+-            hostSaved = host.edit().putBoolean(AppConfig.QQ_NOTICE_V135, true).commit()
+-                    && host.getBoolean(AppConfig.QQ_NOTICE_V135, false);
+-        } catch (Throwable ignored) {
+-        }
+-        Bundle saved = acceptResult(resolverCall(context, "acceptNoticeV36Final1", null, 3));
+-        return hostSaved || saved.getBoolean(AppConfig.QQ_NOTICE_V135, false);
+-    }
+-
++        try { return context.getSharedPreferences(HOST_NOTICE_PREFS, Context.MODE_PRIVATE).getBoolean(AppConfig.QQ_NOTICE_V135, false); }
++        catch (Throwable ignored) { return false; }
++    }
++    static boolean acceptNoticeV135(Context context) { return success(mutate(context, "acceptNoticeV36Final1", null)); }
+     static Bundle healthCheck(Context context) {
+-        try {
+-            Bundle extras = new Bundle();
+-            extras.putLong("token", System.nanoTime());
+-            return acceptResult(resolverCall(context, "healthCheck", extras, 3));
+-        } catch (Throwable error) {
+-            HookLog.error(context, "模块状态检测失败", error);
+-            return Bundle.EMPTY;
+-        }
+-    }
+-
+-    static void reportHook(Context context, String version) {
+-        long now = System.currentTimeMillis();
+-        if (now - lastHookReportTime < 60_000L) return;
+-        try {
+-            Bundle extras = new Bundle();
+-            extras.putString("version", version == null ? "" : version);
+-            Bundle result = acceptResult(resolverCall(context, "reportHook", extras, 2));
+-            if (usable(result)) lastHookReportTime = now;
+-        } catch (Throwable ignored) {
+-        }
+-    }
+-
+-    static void appendLog(Context context, String message) {
+-        try {
+-            Bundle extras = new Bundle();
+-            extras.putString("message", message);
+-            resolverCall(context, "appendLog", extras, 2);
+-        } catch (Throwable ignored) {
+-        }
+-    }
+-
+-    static void runAsync(Runnable write) {
+-        WRITES.execute(() -> {
+-            try {
+-                write.run();
+-            } catch (Throwable ignored) {
+-            }
+-        });
+-    }
+-
+-    /** Makes a switch change visible to the send hook immediately, before the background IPC completes. */
+-    static void stageSettings(boolean masterEnabled, boolean randomEnabled, boolean lockedEnabled,
+-                              int lockedId, int[] pool) {
+-        Bundle staged = cache == null || cache == Bundle.EMPTY ? new Bundle() : new Bundle(cache);
+-        int[] safePool = pool == null ? new int[0] : pool.clone();
+-        boolean validLocked = masterEnabled && lockedEnabled && lockedId >= 1000;
+-        boolean validRandom = masterEnabled && !validLocked && randomEnabled && safePool.length > 0;
+-        staged.putBoolean("masterEnabled", validLocked || validRandom);
+-        staged.putBoolean("randomEnabled", validRandom);
+-        staged.putBoolean("lockedEnabled", validLocked);
+-        staged.putInt("lockedId", validLocked ? lockedId : 0);
+-        staged.putIntArray("pool", safePool);
+-        updateCache(staged);
+-    }
+-
+-    /** Coalesces frequent outgoing messages into one delayed persistence write. */
+-    static void noteApplied(Context context, int id) {
+-        if (context == null || id <= 0) return;
+-        Bundle staged = cache == null || cache == Bundle.EMPTY ? new Bundle() : new Bundle(cache);
+-        staged.putInt("lastAppliedId", id);
+-        updateCache(staged);
+-        int generation = APPLIED_GENERATION.incrementAndGet();
+-        ScheduledFuture<?> next = WRITES.schedule(() -> {
+-            if (generation != APPLIED_GENERATION.get()) return;
+-            try {
+-                Bundle extras = new Bundle();
+-                extras.putInt("id", id);
+-                resolverCall(context, "recordApplied", extras, 2);
+-            } catch (Throwable error) {
+-                HookLog.error(context, "记录最后气泡失败", error);
+-            }
+-        }, 900, TimeUnit.MILLISECONDS);
+-        ScheduledFuture<?> previous = APPLIED_WRITE.getAndSet(next);
+-        if (previous != null) previous.cancel(false);
+-    }
+-
+-    private static Bundle acceptResult(Bundle result) {
+-        if (!usable(result)) {
+-            cacheTime = 0L;
+-            return result == null ? Bundle.EMPTY : result;
+-        }
+-        if (result.containsKey("masterEnabled") || result.containsKey("pool")) updateCache(result);
+-        else cacheTime = 0L;
+-        return result;
+-    }
+-
+-    private static void updateCache(Bundle value) {
+-        value.setClassLoader(HostConfig.class.getClassLoader());
+-        cache = value;
+-        cacheTime = System.currentTimeMillis();
+-    }
+-
+-    private static Bundle resolverCall(Context context, String method, Bundle extras, int attempts) {
+-        Bundle last = Bundle.EMPTY;
+-        Throwable providerError = null;
+-        int count = Math.max(1, attempts);
+-        for (int i = 0; i < count; i++) {
+-            try {
+-                Bundle value = context.getContentResolver().call(URI, method, null, extras);
+-                if (value != null) last = value;
+-                if (usable(value)) {
+-                    mirrorConfig(context, value);
+-                    return value;
+-                }
+-            } catch (Throwable error) {
+-                providerError = error;
+-            }
+-            Thread.yield();
+-        }
+-        Bundle fallback = localCall(context, method, extras);
+-        if (usable(fallback) && providerError != null) {
+-            fallback.putString("_providerError", providerError.getClass().getSimpleName()
+-                    + (providerError.getMessage() == null ? "" : ": " + providerError.getMessage()));
+-            fallback.putString("_configChannel", "QQ 本地兼容存储（Provider 不可用时自动接管）");
+-        }
+-        return usable(fallback) ? fallback : last;
+-    }
+-
+-    /**
+-     * FPA variants may isolate exported providers even though the Hook itself runs normally.
+-     * Keep an atomic QQ-process store as a compatibility channel so imports and switches remain
+-     * persistent instead of silently falling back to an empty in-memory Bundle.
+-     */
+-    private static Bundle localCall(Context context, String method, Bundle extras) {
+-        if (context == null) return Bundle.EMPTY;
+-        SharedPreferences prefs = context.getSharedPreferences(HOST_CONFIG_PREFS, Context.MODE_PRIVATE);
+-        try {
+-            if ("saveSettings".equals(method)) {
+-                int[] values = extras == null ? null : extras.getIntArray("pool");
+-                List<Integer> pool = uniquePool(values);
+-                int lockedId = extras == null ? 0 : Math.max(0, extras.getInt("lockedId", 0));
+-                boolean locked = extras != null && extras.getBoolean("lockedEnabled", false) && lockedId > 0;
+-                boolean random = extras != null && extras.getBoolean("randomEnabled", false)
+-                        && !pool.isEmpty() && !locked;
+-                boolean master = extras != null && extras.getBoolean("masterEnabled", false)
+-                        && (locked || random);
+-                SharedPreferences.Editor editor = prefs.edit()
+-                        .putString("pool", AppConfig.poolJson(pool))
+-                        .putBoolean("masterEnabled", master)
+-                        .putBoolean("randomEnabled", random)
+-                        .putBoolean("lockedEnabled", locked)
+-                        .putInt("lockedId", lockedId)
+-                        .putLong("settingsRevision", System.currentTimeMillis());
+-                if (extras.containsKey("antiRevokeEnabled")) {
+-                    editor.putBoolean("antiRevokeEnabled", extras.getBoolean("antiRevokeEnabled", false));
+-                }
+-                if (!editor.commit()) throw new IllegalStateException("QQ 本地配置提交失败");
+-            } else if ("addBubble".equals(method) || "applyBubble".equals(method)
+-                    || "removeBubble".equals(method)) {
+-                int id = extras == null ? 0 : extras.getInt("id", 0);
+-                List<Integer> pool = AppConfig.readPool(prefs);
+-                if ("removeBubble".equals(method)) {
+-                    pool.remove(Integer.valueOf(id));
+-                    SharedPreferences.Editor editor = prefs.edit().putString("pool", AppConfig.poolJson(pool));
+-                    if (pool.isEmpty()) editor.putBoolean("masterEnabled", false)
+-                            .putBoolean("randomEnabled", false).putBoolean("lockedEnabled", false)
+-                            .putInt("lockedId", 0).putInt("lastAppliedId", 0);
+-                    editor.commit();
+-                } else if (id > 0) {
+-                    if (!pool.contains(id)) pool.add(id);
+-                    SharedPreferences.Editor editor = prefs.edit().putString("pool", AppConfig.poolJson(pool));
+-                    if ("applyBubble".equals(method)) editor.putBoolean("masterEnabled", true)
+-                            .putBoolean("randomEnabled", false).putBoolean("lockedEnabled", true)
+-                            .putInt("lockedId", id).putInt("lastAppliedId", id);
+-                    editor.commit();
+-                }
+-            } else if ("setAntiRevoke".equals(method)) {
+-                prefs.edit().putBoolean("antiRevokeEnabled",
+-                        extras != null && extras.getBoolean("enabled", false)).commit();
+-            } else if ("restoreDefault".equals(method)) {
+-                prefs.edit().putBoolean("masterEnabled", false).putBoolean("randomEnabled", false)
+-                        .putBoolean("lockedEnabled", false).putInt("lockedId", 0)
+-                        .putInt("lastAppliedId", 0).commit();
+-            } else if ("recordApplied".equals(method)) {
+-                int id = extras == null ? 0 : extras.getInt("id", 0);
+-                if (id > 0) prefs.edit().putInt("lastAppliedId", id).apply();
+-            } else if ("reportHook".equals(method)) {
+-                prefs.edit().putLong("lastHookPing", System.currentTimeMillis())
+-                        .putString("lastHookVersion", extras == null ? "" : extras.getString("version", ""))
+-                        .commit();
+-            } else if ("appendLog".equals(method)) {
+-                appendLocalLog(prefs, extras == null ? "" : extras.getString("message", ""));
+-            } else if ("clearLog".equals(method) || "clearRuntimeCache".equals(method)) {
+-                prefs.edit().remove("log").remove("lastLogMessage").remove("lastLogTime").commit();
+-            } else if ("acceptNoticeV36Final1".equals(method)) {
+-                prefs.edit().putBoolean(AppConfig.QQ_NOTICE_V135, true).commit();
+-            }
+-            Bundle result = AppConfig.toBundle(prefs);
+-            result.putBoolean("_healthOk", true);
+-            result.putBoolean("_configFallback", true);
+-            result.putBoolean("_callerAuthorized", true);
+-            result.putString("_configChannel", "QQ 本地兼容存储");
+-            return result;
+-        } catch (Throwable error) {
+-            Bundle failed = new Bundle();
+-            failed.putBoolean("_healthOk", false);
+-            failed.putBoolean("_configFallback", true);
+-            failed.putString("_fallbackError", error.getClass().getSimpleName() + ": " + error.getMessage());
+-            return failed;
+-        }
+-    }
+-
+-    private static List<Integer> uniquePool(int[] values) {
+-        List<Integer> result = new ArrayList<>();
+-        if (values != null) for (int value : values) if (value > 0 && !result.contains(value)) result.add(value);
+-        return result;
+-    }
+-
+-    private static void mirrorConfig(Context context, Bundle value) {
+-        if (context == null || value == null || (!value.containsKey("pool") && !value.containsKey("masterEnabled"))) return;
+-        try {
+-            int[] values = value.getIntArray("pool");
+-            SharedPreferences.Editor editor = context.getSharedPreferences(HOST_CONFIG_PREFS, Context.MODE_PRIVATE).edit()
+-                    .putString("pool", AppConfig.poolJson(uniquePool(values)))
+-                    .putBoolean("masterEnabled", value.getBoolean("masterEnabled", false))
+-                    .putBoolean("randomEnabled", value.getBoolean("randomEnabled", false))
+-                    .putBoolean("lockedEnabled", value.getBoolean("lockedEnabled", false))
+-                    .putInt("lockedId", value.getInt("lockedId", 0))
+-                    .putInt("lastAppliedId", value.getInt("lastAppliedId", 0))
+-                    .putBoolean("antiRevokeEnabled", value.getBoolean("antiRevokeEnabled", false))
+-                    .putLong("lastHookPing", value.getLong("lastHookPing", 0L))
+-                    .putString("lastHookVersion", value.getString("lastHookVersion", ""));
+-            if (value.containsKey(AppConfig.QQ_NOTICE_V135)) {
+-                editor.putBoolean(AppConfig.QQ_NOTICE_V135, value.getBoolean(AppConfig.QQ_NOTICE_V135, false));
+-            }
+-            editor.apply();
+-        } catch (Throwable ignored) {
+-        }
+-    }
+-
+-    private static void appendLocalLog(SharedPreferences prefs, String message) {
+-        if (message == null || message.trim().isEmpty()) return;
+-        String compact = message.trim();
+-        long now = System.currentTimeMillis();
+-        if (compact.equals(prefs.getString("lastLogMessage", ""))
+-                && now - prefs.getLong("lastLogTime", 0L) < 60_000L) return;
+-        String current = prefs.getString("log", "");
+-        String stamp = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date(now));
+-        String combined = current + "[" + stamp + "] " + compact.replace('\n', ' ') + '\n';
+-        String[] lines = combined.split("\\n");
+-        StringBuilder kept = new StringBuilder();
+-        for (int i = Math.max(0, lines.length - 40); i < lines.length; i++) {
+-            if (!lines[i].isEmpty()) kept.append(lines[i]).append('\n');
+-        }
+-        prefs.edit().putString("log", kept.toString()).putString("lastLogMessage", compact)
+-                .putLong("lastLogTime", now).apply();
+-    }
+-
+-    private static boolean usable(Bundle value) {
+-        return value != null && !value.isEmpty() && !value.getBoolean("_authDenied", false);
++        Context host = app(context); if (host == null) return Bundle.EMPTY;
++        synchronized (IO) {
++            Bundle result = ConfigStore.call(prefs(host), "healthCheck", null, true);
++            if (!success(result)) return result;
++            Bundle synced = synchronize(host, result, true);
++            synced.putBoolean("_healthOk", result.getBoolean("_healthOk", false));
++            synced.putBoolean("_callerAuthorized", true);
++            accept(synced, operationGeneration(), true);
++            return synced;
++        }
+     }
+ }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/InQqSettingsDialog.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/InQqSettingsDialog.java
+@@ -37,6 +37,7 @@
+ import android.widget.Toast;
+ 
+ import com.qiutian.bianpaobubble.AppConfig;
++import com.qiutian.bianpaobubble.ReleaseNotes;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
+@@ -74,7 +75,7 @@
+     private static void showEntryNotice(Activity activity) {
+         Dialog dialog = new Dialog(activity);
+         showing = dialog;
+-        LinearLayout body = compactBody(activity, "使用须知", "v3.6 更新后仅显示一次，确认后永久记住。");
++        LinearLayout body = compactBody(activity, "使用须知", "确认后记住，沿用已保存的公告状态。");
+ 
+         TextView guide = text(activity,
+                 "1. 仅支持 QQ 9.2.75 及以上。\n"
+@@ -99,14 +100,20 @@
+         body.addView(back, top(activity, 8));
+ 
+         confirm.setOnClickListener(v -> {
+-            if (!HostConfig.acceptNoticeV135(activity)) {
+-                toast(activity, "公告状态保存失败，请重试");
+-                return;
+-            }
+-            dialog.dismiss();
+-            View decor = activity.getWindow() == null ? null : activity.getWindow().getDecorView();
+-            if (decor != null) decor.post(() -> show(activity));
+-            else show(activity);
++            confirm.setEnabled(false);
++            HostConfig.runAsync(() -> {
++                boolean saved = HostConfig.acceptNoticeV135(activity);
++                activity.runOnUiThread(() -> {
++                    if (activity.isFinishing() || activity.isDestroyed() || !dialog.isShowing()) return;
++                    if (!saved) {
++                        confirm.setEnabled(true);
++                        toast(activity, "公告状态保存失败，请重试");
++                        return;
++                    }
++                    dialog.dismiss();
++                    show(activity);
++                });
++            });
+         });
+         Handler countdownHandler = new Handler(Looper.getMainLooper());
+         int[] seconds = {5};
+@@ -177,7 +184,7 @@
+             heroTextParams.leftMargin = dp(activity, 14);
+             hero.addView(heroText, heroTextParams);
+ 
+-            TextView badge = text(activity, "稳定版  ·  3.6", 11, PINK_DARK, true);
++            TextView badge = text(activity, "修复版  ·  3.7", 11, PINK_DARK, true);
+             badge.setGravity(Gravity.CENTER);
+             badge.setPadding(dp(activity, 12), dp(activity, 6), dp(activity, 12), dp(activity, 6));
+             badge.setBackground(round(activity, Color.rgb(255, 221, 236), 18));
+@@ -242,8 +249,9 @@
+                     config.getBoolean("antiRevokeEnabled", false));
+             antiRevokeMode.setListener(enabled -> {
+                 HostConfig.stageAntiRevoke(enabled);
+-                runConfigWrite(() -> HostConfig.saveAntiRevoke(activity, enabled));
+-                toast(activity, enabled ? "防撤回已开启" : "防撤回已关闭");
++                ConfigUi.write(activity, () -> HostConfig.saveAntiRevoke(activity, enabled),
++                        enabled ? "防撤回已开启" : "防撤回已关闭",
++                        state -> antiRevokeMode.setChecked(state.getBoolean("antiRevokeEnabled", false)));
+             });
+             LinearLayout protectionCard = card(activity, "消息保护",
+                     "功能默认关闭；拦截成功会显示文字提醒，请勿与其他防撤回同时开启。");
+@@ -275,8 +283,9 @@
+                 randomMode.setChecked(false);
+                 int[] pool = poolArray(poolIds);
+                 HostConfig.stageSettings(false, false, false, 0, pool);
+-                runConfigWrite(() -> HostConfig.saveSettings(activity, false, false, false, 0, pool));
+-                toast(activity, "已清除固定 ID，并恢复 QQ 默认气泡");
++                ConfigUi.write(activity, () -> HostConfig.saveSettings(activity, false, false, false, 0, pool),
++                        "已清除固定 ID，并恢复 QQ 默认气泡",
++                        state -> restoreControls(state, poolIds, randomMode, independentMode, fixedEditor, updateManageButton));
+             });
+             fixedRow.addView(clearFixed, new LinearLayout.LayoutParams(dp(activity, 52), dp(activity, 52)));
+             fixedCard.addView(fixedRow, top(activity, 10));
+@@ -317,9 +326,9 @@
+                 int[] pool = poolArray(poolIds);
+                 boolean masterEnabled = randomEnabled || independentEnabled;
+                 HostConfig.stageSettings(masterEnabled, randomEnabled, independentEnabled, fixedId, pool);
+-                runConfigWrite(() -> HostConfig.saveSettings(activity, masterEnabled, randomEnabled,
+-                        independentEnabled, fixedId, pool));
+-                toast(activity, "设置已保存并立即生效");
++                ConfigUi.write(activity, () -> HostConfig.saveSettings(activity, masterEnabled, randomEnabled,
++                        independentEnabled, fixedId, pool), "设置已保存并立即生效",
++                        state -> restoreControls(state, poolIds, randomMode, independentMode, fixedEditor, updateManageButton));
+             });
+             page.addView(save, top(activity, 14));
+ 
+@@ -328,8 +337,8 @@
+             Button clear = button(activity, "清理缓存", Color.rgb(246, 238, 243));
+             clear.setTextColor(TEXT);
+             clear.setOnClickListener(v -> {
+-                runConfigWrite(() -> HostConfig.call(activity, "clearRuntimeCache"));
+-                toast(activity, "缓存已清理，当前设置已保留");
++                ConfigUi.write(activity, () -> HostConfig.call(activity, "clearRuntimeCache"),
++                        "缓存已清理，当前设置已保留", null);
+             });
+             Button restore = button(activity, "恢复 QQ 默认", Color.rgb(255, 222, 235));
+             restore.setTextColor(PINK);
+@@ -339,8 +348,9 @@
+                 independentMode.setChecked(false);
+                 int[] pool = poolArray(poolIds);
+                 HostConfig.stageSettings(false, false, false, 0, pool);
+-                runConfigWrite(() -> HostConfig.saveSettings(activity, false, false, false, 0, pool));
+-                toast(activity, "已停止改写，后续使用 QQ 原气泡");
++                ConfigUi.write(activity, () -> HostConfig.saveSettings(activity, false, false, false, 0, pool),
++                        "已停止改写，后续使用 QQ 原气泡",
++                        state -> restoreControls(state, poolIds, randomMode, independentMode, fixedEditor, updateManageButton));
+             });
+             actions.addView(clear, weight());
+             actions.addView(restore, weight());
+@@ -349,6 +359,19 @@
+             diagnostics.setTextColor(PINK);
+             diagnostics.setOnClickListener(v -> showDiagnosticLog(activity));
+             toolsCard.addView(diagnostics, top(activity, 9));
++            Button changelog = button(activity, "3.7 修复日志", Color.rgb(255, 232, 242));
++            changelog.setTextColor(PINK);
++            changelog.setOnClickListener(v -> {
++                Dialog changes = new Dialog(activity);
++                LinearLayout content = compactBody(activity, "更新日志", "百变气泡 3.7");
++                TextView notes = text(activity, ReleaseNotes.V37, 14, TEXT, false);
++                content.addView(notes, top(activity, 12));
++                Button done = button(activity, "关闭", PINK);
++                done.setOnClickListener(view -> changes.dismiss());
++                content.addView(done, top(activity, 12));
++                showTall(changes, content, activity);
++            });
++            toolsCard.addView(changelog, top(activity, 9));
+             page.addView(toolsCard, top(activity, 12));
+ 
+             Button close = button(activity, "关闭", Color.rgb(255, 255, 255));
+@@ -476,14 +499,21 @@
+                 toast(activity, "这个气泡 ID 已经存在");
+                 return;
+             }
++            if (ids.size() >= AppConfig.MAX_IDS) {
++                toast(activity, "气泡池最多保存 300 个 ID");
++                return;
++            }
+             ids.add(id);
+             boolean masterEnabled = random.isChecked() || independent.isChecked();
+             HostConfig.stageSettings(masterEnabled, random.isChecked(), independent.isChecked(),
+                     parseBubbleId(fixedEditor.getText().toString()), poolArray(ids));
+-            runConfigWrite(() -> HostConfig.call(activity, "addBubble", id));
++            ConfigUi.write(activity, () -> HostConfig.call(activity, "addBubble", id), "已添加气泡 ID：" + id,
++                    state -> {
++                        restoreControls(state, ids, random, independent, fixedEditor, onChanged);
++                        renderPool(activity, container, ids, random, independent, fixedEditor, onChanged);
++                    });
+             renderPool(activity, container, ids, random, independent, fixedEditor, onChanged);
+             onChanged.run();
+-            toast(activity, "已添加气泡 ID：" + id);
+             dialog.dismiss();
+         });
+         body.addView(add, top(activity, 12));
+@@ -506,8 +536,8 @@
+             independent.setChecked(true);
+             random.setChecked(false);
+             HostConfig.stageSettings(true, false, true, id, poolArray(ids));
+-            runConfigWrite(() -> HostConfig.call(activity, "applyBubble", id));
+-            toast(activity, "已固定使用气泡：" + id);
++            ConfigUi.write(activity, () -> HostConfig.call(activity, "applyBubble", id), "已固定使用气泡：" + id,
++                    state -> restoreControls(state, ids, random, independent, fixedEditor, onChanged));
+             dialog.dismiss();
+         });
+         body.addView(fixed, top(activity, 14));
+@@ -536,12 +566,14 @@
+             boolean masterEnabled = random.isChecked() || independent.isChecked();
+             HostConfig.stageSettings(masterEnabled, random.isChecked(), independent.isChecked(),
+                     parseBubbleId(fixedEditor.getText().toString()), poolArray(ids));
+-            runConfigWrite(() -> HostConfig.call(activity, "removeBubble", id));
++            ConfigUi.write(activity, () -> HostConfig.call(activity, "removeBubble", id),
++                    clearedAll ? "已清除气泡；所有模式全部关闭，请手动开启" : "已移除气泡 ID：" + id,
++                    state -> {
++                        restoreControls(state, ids, random, independent, fixedEditor, onChanged);
++                        renderPool(activity, container, ids, random, independent, fixedEditor, onChanged);
++                    });
+             renderPool(activity, container, ids, random, independent, fixedEditor, onChanged);
+             onChanged.run();
+-            toast(activity, clearedAll
+-                    ? "已清除气泡；所有模式全部关闭，请手动开启"
+-                    : "已移除气泡 ID：" + id);
+             dialog.dismiss();
+         });
+         body.addView(remove, top(activity, 8));
+@@ -595,12 +627,14 @@
+             boolean master = decoded.randomEnabled || decoded.lockedEnabled;
+             apply.setEnabled(false);
+             apply.setText("正在保存…");
++            long importGeneration = HostConfig.reserveWrite();
+             HostConfig.runAsync(() -> {
+                 Bundle result = HostConfig.importSettings(activity, master, decoded.randomEnabled,
+-                        decoded.lockedEnabled, decoded.antiRevokeEnabled, decoded.lockedId, pool);
+-                boolean success = result != null && result.containsKey("pool");
++                        decoded.lockedEnabled, decoded.hasAntiRevokeSetting ? decoded.antiRevokeEnabled : null, decoded.lockedId, pool);
++                boolean success = HostConfig.success(result);
+                 activity.runOnUiThread(() -> {
+                     if (activity.isFinishing() || activity.isDestroyed()) return;
++                    if (importGeneration != HostConfig.generation()) { dialog.dismiss(); return; }
+                     if (!success) {
+                         HookLog.error(activity, "导入配置写入失败",
+                                 new IllegalStateException(result == null ? "result=null" : result.toString()));
+@@ -727,8 +761,7 @@
+                             logView.setTextColor(TEXT);
+                             detect.setEnabled(true);
+                             detect.setText("重新检测模块状态");
+-                            toast(activity, health.getBoolean("_healthOk", false)
+-                                    ? "检测完成：未发现明显异常" : "检测完成：发现异常，请复制结果");
++                            toast(activity, "检测完成，请查看各项结果及功能触发状态");
+                         });
+                     });
+                 });
+@@ -754,10 +787,15 @@
+                 Button clear = button(activity, "清空日志", Color.rgb(246, 240, 244));
+                 clear.setTextColor(TEXT);
+                 clear.setOnClickListener(v -> {
+-                    HostConfig.runAsync(() -> HostConfig.call(activity, "clearLog"));
+-                    logView.setText(diagnosticText(""));
+-                    logView.setTextColor(MUTED);
+-                    toast(activity, "诊断日志已清空");
++                    ConfigUi.write(activity, () -> {
++                        Bundle result = HostConfig.call(activity, "clearLog");
++                        if (HostConfig.success(result)) activity.runOnUiThread(() -> {
++                            if (activity.isFinishing() || activity.isDestroyed()) return;
++                            logView.setText(diagnosticText(""));
++                            logView.setTextColor(MUTED);
++                        });
++                        return result;
++                    }, "诊断日志已清空", null);
+                 });
+                 actions.addView(copy, weight());
+                 actions.addView(clear, weight());
+@@ -788,10 +826,7 @@
+         String hookVersion = health == null ? "" : health.getString("lastHookVersion", "");
+         boolean recentHeartbeat = hookPing > 0L
+                 && System.currentTimeMillis() - hookPing < 10 * 60_000L;
+-        // This report is rendered by the in-QQ surface itself, so reaching this code already
+-        // proves that the entry hook is alive. The persisted heartbeat remains useful detail,
+-        // but FPA 3.6 must not turn a delayed provider write into a false Hook failure.
+-        boolean hookAlive = true;
++        boolean hookAlive = HookStatus.active();
+         boolean random = health != null && health.getBoolean("randomEnabled", false);
+         boolean locked = health != null && health.getBoolean("lockedEnabled", false);
+         int lockedId = health == null ? 0 : health.getInt("lockedId", 0);
+@@ -801,31 +836,30 @@
+         boolean fallback = health != null && health.getBoolean("_configFallback", false);
+         String configChannel = health == null ? "" : health.getString("_configChannel", "");
+         String providerError = health == null ? "" : health.getString("_providerError", "");
+-        if ("未检测到".equals(fpaVersion) && hookAlive) {
+-            String remembered = health == null ? "" : health.getString("detectedFpaVersion", "");
+-            fpaVersion = remembered == null || remembered.trim().isEmpty()
+-                    ? "已激活（版本信息被宿主隐藏）" : remembered;
+-        }
+-        boolean allOk = channel && hookAlive && modeValid;
++        boolean antiEnabled = health != null && health.getBoolean("antiRevokeEnabled", false);
++        boolean featuresReady = HookStatus.requiredReady(antiEnabled);
++        boolean qqSupported = !"未检测到".equals(qqVersion) && AppConfig.compareVersion(qqVersion, AppConfig.MIN_QQ_VERSION) >= 0;
++        boolean allOk = channel && hookAlive && featuresReady && modeValid && qqSupported;
+         StringBuilder report = new StringBuilder();
+-        report.append(allOk ? "✓ 模块自检通过" : "! 模块自检发现异常").append('\n');
++        report.append(allOk ? "✓ 静态自检通过（功能触发情况见下方）" : "! 模块自检发现异常或待确认项").append('\n');
+         report.append("QQ：").append(qqVersion).append("（最低 9.2.75）\n");
+         report.append("Android：").append(Build.VERSION.RELEASE).append(" / API ")
+-                .append(Build.VERSION.SDK_INT).append("（兼容 16、17）\n");
+-        report.append("FPA：").append(fpaVersion).append('\n');
++                .append(Build.VERSION.SDK_INT).append('\n');
++        report.append("FPA 安装信息：").append(fpaVersion).append("（不代表当前注入框架）\n");
+         report.append("QQ 内设置入口：正常\n");
+         report.append("配置读取与写入：").append(channel
+-                ? fallback ? "正常（FPA 兼容通道）" : "正常"
++                ? fallback ? "正常（QQ 本地兼容通道）" : "正常"
+                 : denied ? "权限被拒绝" : "失败").append('\n');
+         if (channel && !configChannel.isEmpty()) {
+             report.append("配置通道：").append(configChannel).append('\n');
+         }
+         if (channel && fallback && !providerError.isEmpty()) {
+-            report.append("Provider 状态：受框架限制，已自动接管（")
++            report.append("Provider 状态：暂不可用，使用本地通道（")
+                     .append(providerError).append("）\n");
+         }
+-        report.append("Hook 注入：正常（QQ 设置页已加载）\n");
+-        report.append("Hook 心跳：").append(recentHeartbeat ? "正常" : "当前会话正常（后台记录待同步）");
++        report.append("Hook 注入：").append(hookAlive ? "当前进程已初始化" : "未记录初始化完成").append('\n');
++        report.append(HookStatus.describe());
++        report.append("Hook 心跳：").append(recentHeartbeat ? "已记录" : "记录待同步");
+         if (!hookVersion.isEmpty()) report.append("（QQ ").append(hookVersion).append("）");
+         report.append('\n');
+         report.append("模式配置：").append(modeValid ? "正常" : "冲突或缺少 ID").append('\n');
+@@ -836,10 +870,13 @@
+             report.append("\n错误代码：");
+             if (!channel) report.append(denied ? " CFG-AUTH-001" : " CFG-IO-001");
+             if (!modeValid) report.append(" MODE-STATE-001");
++            if (!hookAlive || !featuresReady) report.append(" HOOK-PARTIAL-001");
++            if (!qqSupported) report.append(" QQ-VERSION-001");
+         } else if (!recentHeartbeat) {
+-            report.append("\n状态代码：HOOK-HB-DEFERRED（当前 Hook 正常，不计为故障）");
++            report.append("\n状态代码：HOOK-HB-DEFERRED（后台心跳待同步）");
+         }
+         if (!channel && health != null) {
++            report.append("\n存储错误：").append(health.getString("_error", "探针写入或读取未通过"));
+             report.append("\n调用 UID：").append(health.getInt("_callingUid", -1));
+             report.append("\n调用包：").append(health.getString("_callerPackages", "未知"));
+         }
+@@ -1036,7 +1073,7 @@
+     private static List<Integer> poolList(int[] pool) {
+         List<Integer> result = new ArrayList<>();
+         if (pool == null) return result;
+-        for (int id : pool) if (id > 0 && !result.contains(id)) result.add(id);
++        for (int id : pool) if (id >= 1000 && !result.contains(id)) result.add(id);
+         return result;
+     }
+ 
+@@ -1054,14 +1091,21 @@
+         int[] pool = poolArray(ids);
+         boolean masterEnabled = randomEnabled || independentEnabled;
+         HostConfig.stageSettings(masterEnabled, randomEnabled, independentEnabled, fixedId, pool);
+-        runConfigWrite(() -> HostConfig.saveSettings(activity, masterEnabled, randomEnabled,
+-                independentEnabled, fixedId, pool));
+-        toast(activity, independentEnabled ? "独立模式已生效"
+-                : randomEnabled ? "随机模式已生效" : "气泡模式已关闭");
+-    }
+-
+-    private static void runConfigWrite(Runnable write) {
+-        HostConfig.runAsync(write);
++        ConfigUi.write(activity, () -> HostConfig.saveSettings(activity, masterEnabled, randomEnabled,
++                independentEnabled, fixedId, pool), independentEnabled ? "独立模式已生效"
++                : randomEnabled ? "随机模式已生效" : "气泡模式已关闭",
++                state -> restoreControls(state, ids, random, independent, fixedEditor, null));
++    }
++
++    private static void restoreControls(Bundle state, List<Integer> ids, ModeSwitch random,
++                                         ModeSwitch independent, EditText fixedEditor, Runnable onChanged) {
++        ids.clear();
++        ids.addAll(poolList(state.getIntArray("pool")));
++        random.setChecked(state.getBoolean("randomEnabled", false));
++        independent.setChecked(state.getBoolean("lockedEnabled", false));
++        int id = state.getInt("lockedId", 0);
++        fixedEditor.setText(id >= 1000 ? String.valueOf(id) : "");
++        if (onChanged != null) onChanged.run();
+     }
+ 
+     private static int parseBubbleId(String input) {
+@@ -1069,7 +1113,7 @@
+             String text = input == null ? "" : input.trim();
+             if (!text.matches("[0-9]{4,10}")) return 0;
+             int value = Integer.parseInt(text);
+-            return value > 0 ? value : 0;
++            return value >= 1000 ? value : 0;
+         } catch (Throwable ignored) {
+             return 0;
+         }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/MallIdParser.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/MallIdParser.java
+@@ -0,0 +1,59 @@
++package com.qiutian.bianpaobubble.hook;
++
++import java.net.URLDecoder;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/** QQ's explicit VAS type 2 identifies bubbles. Never accepts bare or partial IDs. */
++final class MallIdParser {
++    private static final Pattern MARKER = Pattern.compile(
++            "(?i)(?:^|[?&#;\\s{,])(?:S\\.)?[\"']?(itemid|item_id|kr_turbo_display)[\"']?\\s*[:=]\\s*[\"']?([^&#;\\s,\"'}\\]]+)");
++    private static final Pattern DIRECT = Pattern.compile("2_([0-9]{4,10})");
++    private MallIdParser() {}
++
++    static boolean isItemKey(String key) {
++        return "itemid".equalsIgnoreCase(key) || "item_id".equalsIgnoreCase(key)
++                || "kr_turbo_display".equalsIgnoreCase(key);
++    }
++    static int direct(String input) {
++        if (input == null) return 0;
++        Matcher match = DIRECT.matcher(input.trim());
++        return match.matches() ? id(match.group(1)) : 0;
++    }
++    static int parse(String input) {
++        Selection result = new Selection();
++        collect(input, result);
++        return result.value();
++    }
++    static void collect(String input, Selection result) {
++        if (input == null || input.length() > 32_768) return;
++        String decoded = input;
++        try {
++            for (int i = 0; i < 2 && decoded.indexOf('%') >= 0; i++) decoded = URLDecoder.decode(decoded, "UTF-8");
++        } catch (Exception ignored) { return; }
++        Matcher match = MARKER.matcher(decoded);
++        while (match.find()) collectValue(match.group(1), match.group(2), result);
++    }
++    static void collectValue(String key, String input, Selection result) {
++        if (!isItemKey(key) || input == null) return;
++        int found = direct(input);
++        if (found > 0) result.add(found);
++        else if (input.trim().matches("[0-9]+_.*")) result.ambiguous = true;
++        // An unprefixed item ID supplies no type evidence. Ignore it; a separate
++        // kr_turbo_display=2_ID may still identify the actual bubble correctly.
++    }
++    private static int id(String text) {
++        try { int value = Integer.parseInt(text); return value >= 1000 ? value : 0; }
++        catch (NumberFormatException ignored) { return 0; }
++    }
++    static final class Selection {
++        int id;
++        boolean ambiguous;
++        void add(int value) {
++            if (value <= 0) return;
++            if (id != 0 && id != value) ambiguous = true;
++            else id = value;
++        }
++        int value() { return ambiguous ? 0 : id; }
++    }
++}
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/NtMenuFactory.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/NtMenuFactory.java
+@@ -22,9 +22,7 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+-import java.util.WeakHashMap;
+ import java.util.concurrent.ConcurrentHashMap;
+ 
+ import de.robv.android.xposed.XC_MethodHook;
+@@ -35,7 +33,7 @@
+  * keeps the APK small, and is safer on FPA and traditional Xposed loaders.
+  */
+ final class NtMenuFactory {
+-    private static final Map<Object, Runnable> ACTIONS = Collections.synchronizedMap(new WeakHashMap<>());
++    private static final WeakIdentityMap<Runnable> ACTIONS = new WeakIdentityMap<>(128);
+     private static final Set<String> HOOKED = Collections.newSetFromMap(new ConcurrentHashMap<>());
+     private static final Set<String> VIEW_SCANNED = Collections.newSetFromMap(new ConcurrentHashMap<>());
+ 
+@@ -117,6 +115,7 @@
+ 
+     private static void hookViewMethod(Class<?> owner, Method method, Class<?> itemClass,
+                                        Context context, String kind) {
++        if (!method.getReturnType().isAssignableFrom(LinearLayout.class)) return;
+         String key = "view:" + owner.getName() + '#' + method.toGenericString() + ':' + itemClass.getName();
+         if (!HOOKED.add(key)) return;
+         try {
+@@ -162,7 +161,7 @@
+         icon.setClipToOutline(true);
+         Drawable drawable = loadModuleIcon(context);
+         if (drawable != null) icon.setImageDrawable(drawable);
+-        cell.addView(icon, new LinearLayout.LayoutParams(dp(context, 28), dp(context, 28)));
++        cell.addView(icon, new LinearLayout.LayoutParams(dp(context, 24), dp(context, 24)));
+ 
+         TextView title = new TextView(context);
+         title.setText("秋天");
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/ProtoLite.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/ProtoLite.java
+@@ -17,6 +17,10 @@
+ 
+     static boolean isSelfMsgPush(byte[] push) {
+         byte[] message = firstBytes(push, 1);
++        return isSelfQqMessage(message);
++    }
++
++    private static boolean isSelfQqMessage(byte[] message) {
+         byte[] head = firstBytes(message, 1);
+         String senderUid = firstString(head, 2);
+         String receiverUid = firstString(head, 6);
+@@ -25,67 +29,42 @@
+ 
+     static RewriteResult stripSyncRecall(byte[] source) {
+         if (source == null || source.length == 0) return new RewriteResult(source, false);
++        return rewriteSync(source, 0);
++    }
++
++    /** InfoSyncPush[8] -> SyncMsgRecall[4] -> SyncInfoBody[8]. */
++    private static RewriteResult rewriteSync(byte[] source, int level) {
+         List<Field> fields = parse(source);
+-        ByteArrayOutputStream output = new ByteArrayOutputStream(source.length);
+-        boolean changed = false;
++        ByteArrayOutputStream output = null;
++        int selectedField = level == 1 ? 4 : 8;
+         for (Field field : fields) {
+-            if (field.number == 8 && field.wireType == 2) {
++            if (field.number == selectedField && field.wireType == 2) {
+                 byte[] content = Arrays.copyOfRange(source, field.payloadStart, field.payloadEnd);
+-                RewriteResult rewritten = stripRecallContent(content);
+-                if (rewritten.changed) {
+-                    writeField(output, field.number, rewritten.bytes);
+-                    changed = true;
++                boolean remove = level == 2 && isRecallQqMessage(content) && !isSelfQqMessage(content);
++                RewriteResult child = level < 2 ? rewriteSync(content, level + 1) : null;
++                if (remove || child != null && child.changed) {
++                    if (output == null) {
++                        output = new ByteArrayOutputStream(source.length);
++                        output.write(source, 0, field.start);
++                    }
++                    if (!remove) writeField(output, field.number, child.bytes);
+                     continue;
+                 }
+             }
+-            output.write(source, field.start, field.end - field.start);
+-        }
+-        return changed ? new RewriteResult(output.toByteArray(), true) : new RewriteResult(source, false);
+-    }
+-
+-    private static RewriteResult stripRecallContent(byte[] content) {
+-        List<Field> fields = parse(content);
+-        ByteArrayOutputStream output = new ByteArrayOutputStream(content.length);
+-        boolean changed = false;
+-        for (Field field : fields) {
+-            if (field.number == 4 && field.wireType == 2) {
+-                byte[] body = Arrays.copyOfRange(content, field.payloadStart, field.payloadEnd);
+-                RewriteResult rewritten = stripRecallBody(body);
+-                if (rewritten.changed) {
+-                    writeField(output, field.number, rewritten.bytes);
+-                    changed = true;
+-                    continue;
+-                }
+-            }
+-            output.write(content, field.start, field.end - field.start);
+-        }
+-        return changed ? new RewriteResult(output.toByteArray(), true) : new RewriteResult(content, false);
+-    }
+-
+-    private static RewriteResult stripRecallBody(byte[] body) {
+-        List<Field> fields = parse(body);
+-        boolean containsRecall = false;
+-        for (Field field : fields) {
+-            if (field.number == 8 && field.wireType == 2) {
+-                byte[] message = Arrays.copyOfRange(body, field.payloadStart, field.payloadEnd);
+-                if (isRecallQqMessage(message)) {
+-                    containsRecall = true;
+-                    break;
+-                }
+-            }
+-        }
+-        if (!containsRecall) return new RewriteResult(body, false);
+-        ByteArrayOutputStream output = new ByteArrayOutputStream(body.length);
+-        for (Field field : fields) {
+-            if (field.number != 8) output.write(body, field.start, field.end - field.start);
+-        }
+-        return new RewriteResult(output.toByteArray(), true);
++            if (output != null) output.write(source, field.start, field.end - field.start);
++        }
++        return output == null ? new RewriteResult(source, false) : new RewriteResult(output.toByteArray(), true);
+     }
+ 
+     private static boolean isRecallQqMessage(byte[] message) {
+         byte[] content = firstBytes(message, 2);
+-        long type = firstVarint(content, 1, -1L);
+-        long subType = firstVarint(content, 2, -1L);
++        long type = -1L;
++        long subType = -1L;
++        for (Field field : parse(content)) {
++            if (field.wireType != 0) continue;
++            if (field.number == 1) type = field.varintValue;
++            else if (field.number == 2) subType = field.varintValue;
++        }
+         return (type == 732L && subType == 17L) || (type == 528L && subType == 138L);
+     }
+ 
+@@ -115,11 +94,13 @@
+     private static List<Field> parse(byte[] source) {
+         List<Field> fields = new ArrayList<>();
+         if (source == null) return fields;
++        if (source.length > 4 * 1024 * 1024) throw new IllegalArgumentException("protobuf packet too large");
+         int offset = 0;
+         while (offset < source.length) {
+             int start = offset;
+             Varint tag = readVarint(source, offset);
+             offset = tag.end;
++            if ((tag.value >>> 3) > 536_870_911L) throw new IllegalArgumentException("protobuf tag out of range");
+             int number = (int) (tag.value >>> 3);
+             int wire = (int) (tag.value & 7L);
+             if (number <= 0) throw new IllegalArgumentException("invalid protobuf field");
+@@ -136,7 +117,7 @@
+                 offset = payloadEnd;
+             } else if (wire == 2) {
+                 Varint length = readVarint(source, offset);
+-                if (length.value > Integer.MAX_VALUE) throw new IllegalArgumentException("protobuf field too large");
++                if (length.value < 0 || length.value > Integer.MAX_VALUE) throw new IllegalArgumentException("protobuf field too large");
+                 payloadStart = length.end;
+                 payloadEnd = checkedEnd(payloadStart, (int) length.value, source.length);
+                 offset = payloadEnd;
+@@ -146,6 +127,7 @@
+             } else {
+                 throw new IllegalArgumentException("unsupported protobuf wire type " + wire);
+             }
++            if (fields.size() >= 100_000) throw new IllegalArgumentException("too many protobuf fields");
+             fields.add(new Field(number, wire, start, payloadStart, payloadEnd, offset, value));
+         }
+         return fields;
+@@ -161,6 +143,7 @@
+         long result = 0L;
+         for (int shift = 0; shift < 64 && offset < source.length; shift += 7) {
+             int current = source[offset++] & 0xff;
++            if (shift == 63 && (current & 0xfe) != 0) throw new IllegalArgumentException("protobuf varint overflow");
+             result |= (long) (current & 0x7f) << shift;
+             if ((current & 0x80) == 0) return new Varint(result, offset);
+         }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/Reflector.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/Reflector.java
+@@ -1,351 +1,181 @@
+ package com.qiutian.bianpaobubble.hook;
+ 
+ import java.lang.reflect.Field;
+-import java.lang.reflect.Array;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Modifier;
+ import java.util.Collection;
+ import java.util.IdentityHashMap;
++import java.util.LinkedHashMap;
+ import java.util.Map;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+ 
++/** Bounded lookups of QQ's message model; never searches message text for IDs. */
+ final class Reflector {
+-    private static final Pattern BUBBLE_ID_TEXT = Pattern.compile(
+-            "(?i)(?:subBubbleId|bubbleId|bubble_id|themeBubbleId)[\\\"']?\\s*(?:=|:)[\\\"']?\\s*(?:2_)?([0-9]{4,10})");
++    private static final int MAX_TYPES = 64;
++    private static final Map<Class<?>, Accessors> ACCESS = new LinkedHashMap<Class<?>, Accessors>(16, .75f, true) {
++        @Override protected boolean removeEldestEntry(Map.Entry<Class<?>, Accessors> eldest) { return size() > MAX_TYPES; }
++    };
++    private static final class Accessors {
++        final Map<String, Field> fields = new LinkedHashMap<>();
++        final Map<String, Method> methods = new LinkedHashMap<>();
++    }
+     private Reflector() {}
+ 
++    private static Field findField(Class<?> type, String name) {
++        synchronized (ACCESS) {
++            Accessors access = ACCESS.get(type);
++            if (access == null) { access = new Accessors(); ACCESS.put(type, access); }
++            if (access.fields.containsKey(name)) return access.fields.get(name);
++            Field found = null;
++            for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
++                try {
++                    found = current.getDeclaredField(name);
++                    if (Modifier.isStatic(found.getModifiers())) { found = null; break; }
++                    found.setAccessible(true); break;
++                } catch (NoSuchFieldException ignored) {
++                } catch (Throwable ignored) { found = null; break; }
++            }
++            access.fields.put(name, found);
++            return found;
++        }
++    }
+     static Object field(Object object, String... names) {
+         if (object == null) return null;
+         for (String name : names) {
++            try {
++                Field found = findField(object.getClass(), name);
++                if (found == null) continue;
++                Object value = found.get(object);
++                if (value != null) return value;
++            } catch (Throwable ignored) {}
++        }
++        return null;
++    }
++    static boolean setNumber(Object object, String name, int value) {
++        if (object == null) return false;
++        try {
++            Field found = findField(object.getClass(), name);
++            if (found == null) return false;
++            Class<?> type = found.getType();
++            if (type == int.class || type == Integer.class) found.set(object, value);
++            else if (type == long.class || type == Long.class) found.set(object, (long) value);
++            else if (type == String.class) found.set(object, String.valueOf(value));
++            else return false; // A short would silently truncate a bubble ID.
++            return true;
++        } catch (Throwable ignored) { return false; }
++    }
++    static int positiveInt(Object value) {
++        if (!(value instanceof Number) && !(value instanceof CharSequence)) return 0;
++        if (value instanceof Float || value instanceof Double) return 0;
++        try {
++            int number = Integer.parseInt(value.toString().trim());
++            return number > 0 ? number : 0;
++        } catch (NumberFormatException ignored) { return 0; }
++    }
++    private static Object property(Object object, String field, String getter) {
++        Object value = field(object, field);
++        return value == null ? invokeNoArgs(object, getter) : value;
++    }
++    static Object bubbleInfoFromArgs(Object[] args) {
++        if (args == null) return null;
++        for (Object arg : args) if (arg instanceof Map) {
++            Object found = bubbleInfoFromAttrs(arg);
++            if (found != null) return found;
++        }
++        return null;
++    }
++    /** sendMsg supplies Map<Integer, MsgAttributeInfo>; inspect only VAS attributes. */
++    static Object bubbleInfoFromAttrs(Object attrs) {
++        if (!(attrs instanceof Map)) return null;
++        int count = 0;
++        for (Object attribute : ((Map<?, ?>) attrs).values()) {
++            if (++count > 32) break;
++            Object vas = property(attribute, "vasMsgInfo", "getVasMsgInfo");
++            Object bubble = property(vas, "bubbleInfo", "getBubbleInfo");
++            if (bubble != null) return bubble;
++        }
++        return null;
++    }
++    static Object bubbleInfo(Object object) {
++        Object record = messageRecord(object, 0, new IdentityHashMap<>());
++        return record == null ? null : bubbleInfoFromAttrs(property(record, "msgAttrs", "getMsgAttrs"));
++    }
++    static int bubbleId(Object object) {
++        Object record = messageRecord(object, 0, new IdentityHashMap<>());
++        if (record == null || !hasBubbleContent(record)) return 0;
++        Object bubble = bubbleInfoFromAttrs(property(record, "msgAttrs", "getMsgAttrs"));
++        if (bubble == null) return 0;
++        Object mainValue = property(bubble, "bubbleId", "getBubbleId");
++        int main = positiveInt(mainValue);
++        int sub = positiveInt(property(bubble, "subBubbleId", "getSubBubbleId"));
++        // QQ can retain an old sub-ID while the main ID explicitly selects its default skin.
++        if (mainValue != null && main < 1000) return 0;
++        return sub >= 1000 ? sub : main >= 1000 ? main : 0;
++    }
++    private static Object messageRecord(Object object, int depth, IdentityHashMap<Object, Boolean> seen) {
++        if (object == null || depth > 3 || seen.put(object, Boolean.TRUE) != null) return null;
++        if (object instanceof CharSequence || object instanceof Number || object instanceof Collection
++                || object instanceof Map || object.getClass().isArray()) return null;
++        Object elements = property(object, "elements", "getElements");
++        if (elements instanceof Collection && property(object, "msgAttrs", "getMsgAttrs") instanceof Map) return object;
++        for (String method : new String[]{"getMsgRecord", "getRecord", "getData"}) {
++            Object found = messageRecord(invokeNoArgs(object, method), depth + 1, seen);
++            if (found != null) return found;
++        }
++        for (String name : new String[]{"msgRecord", "record", "data"}) {
++            Object found = messageRecord(field(object, name), depth + 1, seen);
++            if (found != null) return found;
++        }
++        return null;
++    }
++    private static boolean hasBubbleContent(Object record) {
++        Object raw = property(record, "elements", "getElements");
++        if (!(raw instanceof Collection)) return false;
++        Collection<?> elements = (Collection<?>) raw;
++        if (elements.isEmpty() || elements.size() > 256) return false;
++        boolean text = false;
++        for (Object element : elements) {
++            // A standalone sticker/face may carry stale VAS metadata without rendering a bubble.
++            if (property(element, "marketFaceElement", "getMarketFaceElement") != null
++                    || property(element, "faceBubbleElement", "getFaceBubbleElement") != null
++                    || property(element, "giphyElement", "getGiphyElement") != null) return false;
++            Object textElement = property(element, "textElement", "getTextElement");
++            Object content = property(textElement, "content", "getContent");
++            if (content instanceof CharSequence && content.toString().trim().length() > 0) text = true;
++        }
++        return text;
++    }
++    static Object invokeNoArgs(Object object, String name) {
++        if (object == null) return null;
++        Method found;
++        synchronized (ACCESS) {
+             Class<?> type = object.getClass();
+-            while (type != null && type != Object.class) {
+-                try {
+-                    Field field = type.getDeclaredField(name);
+-                    field.setAccessible(true);
+-                    return field.get(object);
+-                } catch (Throwable ignored) {
+-                    type = type.getSuperclass();
++            Accessors access = ACCESS.get(type);
++            if (access == null) { access = new Accessors(); ACCESS.put(type, access); }
++            if (access.methods.containsKey(name)) found = access.methods.get(name);
++            else {
++                found = null;
++                for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
++                    try {
++                        found = current.getDeclaredMethod(name);
++                        if (Modifier.isStatic(found.getModifiers())) { found = null; break; }
++                        found.setAccessible(true); break;
++                    } catch (NoSuchMethodException ignored) {
++                    } catch (Throwable ignored) { found = null; break; }
++                }
++                access.methods.put(name, found);
++            }
++        }
++        try { return found == null ? null : found.invoke(object); }
++        catch (Throwable ignored) { return null; }
++    }
++    static Field firstInstanceField(Class<?> type, Class<?> wanted) {
++        for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
++            for (Field field : current.getDeclaredFields()) {
++                if (!Modifier.isStatic(field.getModifiers()) && wanted.isAssignableFrom(field.getType())) {
++                    field.setAccessible(true); return field;
+                 }
+             }
+         }
+         return null;
+     }
+-
+-    static boolean setNumber(Object object, String name, int value) {
+-        if (object == null) return false;
+-        Class<?> type = object.getClass();
+-        while (type != null && type != Object.class) {
+-            try {
+-                Field field = type.getDeclaredField(name);
+-                field.setAccessible(true);
+-                Class<?> ft = field.getType();
+-                if (ft == int.class || ft == Integer.class) field.set(object, value);
+-                else if (ft == long.class || ft == Long.class) field.set(object, (long) value);
+-                else if (ft == short.class || ft == Short.class) field.set(object, (short) value);
+-                else if (ft == String.class) field.set(object, String.valueOf(value));
+-                else return false;
+-                return true;
+-            } catch (Throwable ignored) {
+-                type = type.getSuperclass();
+-            }
+-        }
+-        return false;
+-    }
+-
+-    static int positiveInt(Object value) {
+-        if (value == null) return 0;
+-        try {
+-            int parsed = Integer.parseInt(String.valueOf(value).trim());
+-            return parsed > 0 ? parsed : 0;
+-        } catch (Throwable ignored) {
+-            return 0;
+-        }
+-    }
+-
+-    static Object bubbleInfoFromArgs(Object[] args) {
+-        if (args == null) return null;
+-        IdentityHashMap<Object, Boolean> visited = new IdentityHashMap<>();
+-        for (Object arg : args) {
+-            Object found = bubbleInfo(arg, 0, visited);
+-            if (found != null) return found;
+-        }
+-        return null;
+-    }
+-
+-    /** QQ 9.2.75 sends HashMap<Integer, MsgAttributeInfo> as sendMsg argument 3. */
+-    static Object bubbleInfoFromAttrs(Object attrs) {
+-        if (attrs == null) return null;
+-        if (attrs instanceof Map) {
+-            for (Object attr : ((Map<?, ?>) attrs).values()) {
+-                Object bubble = bubbleInfoFromAttribute(attr);
+-                if (bubble != null) return bubble;
+-            }
+-        }
+-        return bubbleInfoFromAttribute(attrs);
+-    }
+-
+-    private static Object bubbleInfoFromAttribute(Object attr) {
+-        if (attr == null) return null;
+-        Object vas = field(attr, "vasMsgInfo");
+-        Object bubble = field(vas, "bubbleInfo");
+-        if (bubble != null) return bubble;
+-        bubble = field(attr, "bubbleInfo");
+-        return bubble != null ? bubble : bubbleInfo(attr);
+-    }
+-
+-    static Object bubbleInfo(Object object) {
+-        return bubbleInfo(object, 0, new IdentityHashMap<>());
+-    }
+-
+-    private static Object bubbleInfo(Object object, int depth, IdentityHashMap<Object, Boolean> visited) {
+-        if (object == null || depth > 7 || visited.size() > 160 || isScalar(object)
+-                || visited.put(object, Boolean.TRUE) != null) return null;
+-        String className = object.getClass().getName();
+-        if ((className.contains("BubbleInfo") || (hasField(object.getClass(), "subBubbleId") && hasField(object.getClass(), "bubbleId")))
+-                && (hasField(object.getClass(), "subBubbleId") || hasField(object.getClass(), "bubbleId"))) return object;
+-        Object direct = field(object, "bubbleInfo");
+-        if (direct != null) return direct;
+-        Object vas = field(object, "vasMsgInfo");
+-        if (vas != null) {
+-            Object bubble = field(vas, "bubbleInfo");
+-            if (bubble != null) return bubble;
+-        }
+-        Object attrs = field(object, "msgAttrs");
+-        if (attrs != null && attrs != object) {
+-            Object bubble = bubbleInfo(attrs, depth + 1, visited);
+-            if (bubble != null) return bubble;
+-        }
+-        for (String methodName : new String[]{"getMsgRecord", "getRecord", "getData", "getMsgAttrs"}) {
+-            Object nested = invokeNoArgs(object, methodName);
+-            if (nested != null && nested != object) {
+-                Object bubble = bubbleInfo(nested, depth + 1, visited);
+-                if (bubble != null) return bubble;
+-            }
+-        }
+-        if (object instanceof Map) {
+-            for (Map.Entry<?, ?> entry : ((Map<?, ?>) object).entrySet()) {
+-                Object keyBubble = bubbleInfo(entry.getKey(), depth + 1, visited);
+-                if (keyBubble != null) return keyBubble;
+-                Object value = entry.getValue();
+-                Object bubble = bubbleInfo(value, depth + 1, visited);
+-                if (bubble != null) return bubble;
+-            }
+-        } else if (object instanceof Collection) {
+-            for (Object value : (Collection<?>) object) {
+-                Object bubble = bubbleInfo(value, depth + 1, visited);
+-                if (bubble != null) return bubble;
+-            }
+-        } else if (object.getClass().isArray()) {
+-            int length = Math.min(Array.getLength(object), 64);
+-            for (int i = 0; i < length; i++) {
+-                Object bubble = bubbleInfo(Array.get(object, i), depth + 1, visited);
+-                if (bubble != null) return bubble;
+-            }
+-        }
+-        for (String name : new String[]{"data", "msgRecord", "record", "records", "anonymousExtInfo"}) {
+-            Object nested = field(object, name);
+-            if (nested != null && nested != object) {
+-                Object bubble = bubbleInfo(nested, depth + 1, visited);
+-                if (bubble != null) return bubble;
+-            }
+-        }
+-        if (className.startsWith("com.tencent.") || className.startsWith("mqq.") || className.contains("nativeinterface")) {
+-            Class<?> type = object.getClass();
+-            while (type != null && type != Object.class) {
+-                for (Field candidate : type.getDeclaredFields()) {
+-                    if (Modifier.isStatic(candidate.getModifiers()) || candidate.getType().isPrimitive()) continue;
+-                    try {
+-                        candidate.setAccessible(true);
+-                        Object value = candidate.get(object);
+-                        if (value == null || value == object) continue;
+-                        String fieldName = candidate.getName().toLowerCase();
+-                        if (fieldName.contains("bubble") && (hasField(value.getClass(), "subBubbleId")
+-                                || hasField(value.getClass(), "bubbleId"))) return value;
+-                        Object bubble = bubbleInfo(value, depth + 1, visited);
+-                        if (bubble != null) return bubble;
+-                    } catch (Throwable ignored) {
+-                    }
+-                }
+-                type = type.getSuperclass();
+-            }
+-        }
+-        return null;
+-    }
+-
+-    static int bubbleId(Object object) {
+-        return bubbleId(object, 0, new IdentityHashMap<>());
+-    }
+-
+-    private static int bubbleId(Object object, int depth, IdentityHashMap<Object, Boolean> visited) {
+-        if (object == null || depth > 8 || visited.size() > 220) return 0;
+-        if (object instanceof CharSequence) return bubbleIdFromText(String.valueOf(object));
+-        if (isScalar(object) || visited.put(object, Boolean.TRUE) != null) return 0;
+-
+-        int id = namedBubbleValue(object);
+-        if (id > 0) return id;
+-
+-        Object data = field(object, "data", "msgRecord", "record");
+-        if (data != null && data != object) {
+-            int nested = bubbleId(data, depth + 1, visited);
+-            if (nested > 0) return nested;
+-        }
+-
+-        Object attrs = field(object, "msgAttrs");
+-        Object bubble = bubbleInfoFromAttrs(attrs);
+-        id = bubbleValue(bubble);
+-        if (id > 0) return id;
+-
+-        if (object instanceof Map) {
+-            for (Map.Entry<?, ?> entry : ((Map<?, ?>) object).entrySet()) {
+-                String key = String.valueOf(entry.getKey()).toLowerCase();
+-                Object value = entry.getValue();
+-                if (key.contains("bubble") && (key.contains("id") || key.contains("info"))) {
+-                    id = positiveInt(value);
+-                    if (id > 0) return id;
+-                    id = bubbleIdFromText(String.valueOf(value));
+-                    if (id > 0) return id;
+-                }
+-                id = bubbleId(value, depth + 1, visited);
+-                if (id > 0) return id;
+-            }
+-        } else if (object instanceof Collection) {
+-            for (Object value : (Collection<?>) object) {
+-                id = bubbleId(value, depth + 1, visited);
+-                if (id > 0) return id;
+-            }
+-        } else if (object.getClass().isArray()) {
+-            int length = Math.min(Array.getLength(object), 64);
+-            for (int i = 0; i < length; i++) {
+-                id = bubbleId(Array.get(object, i), depth + 1, visited);
+-                if (id > 0) return id;
+-            }
+-        }
+-
+-        Object anonymous = field(object, "anonymousExtInfo");
+-        id = positiveInt(field(anonymous, "bubbleId", "subBubbleId"));
+-        if (id > 0) return id;
+-
+-        Object records = field(object, "records");
+-        if (records instanceof Collection) {
+-            for (Object record : (Collection<?>) records) {
+-                id = bubbleId(record, depth + 1, visited);
+-                if (id > 0) return id;
+-            }
+-        } else if (records != null && records.getClass().isArray()) {
+-            int length = Math.min(Array.getLength(records), 64);
+-            for (int i = 0; i < length; i++) {
+-                id = bubbleId(Array.get(records, i), depth + 1, visited);
+-                if (id > 0) return id;
+-            }
+-        }
+-
+-        bubble = bubbleInfo(object);
+-        id = bubbleValue(bubble);
+-        if (id > 0) return id;
+-
+-        for (String methodName : new String[]{"getMsgRecord", "getRecord", "getData", "getMsgAttrs",
+-                "getSourceMsgRecord", "getOriginMsgRecord", "getTemplateMsgRecord"}) {
+-            Object nested = invokeNoArgs(object, methodName);
+-            if (nested == null || nested == object) continue;
+-            id = bubbleId(nested, depth + 1, visited);
+-            if (id > 0) return id;
+-        }
+-
+-        String className = object.getClass().getName();
+-        if (className.startsWith("com.tencent.") || className.startsWith("mqq.")
+-                || className.contains("nativeinterface")) {
+-            Class<?> type = object.getClass();
+-            while (type != null && type != Object.class) {
+-                for (Field candidate : type.getDeclaredFields()) {
+-                    if (Modifier.isStatic(candidate.getModifiers())) continue;
+-                    try {
+-                        candidate.setAccessible(true);
+-                        Object value = candidate.get(object);
+-                        if (value == null || value == object) continue;
+-                        String name = candidate.getName().toLowerCase();
+-                        if (name.contains("bubble") && name.contains("id")) {
+-                            id = positiveInt(value);
+-                            if (id > 0) return id;
+-                        }
+-                        if (!candidate.getType().isPrimitive()) {
+-                            id = bubbleId(value, depth + 1, visited);
+-                            if (id > 0) return id;
+-                        }
+-                    } catch (Throwable ignored) {
+-                    }
+-                }
+-                type = type.getSuperclass();
+-            }
+-        }
+-        return 0;
+-    }
+-
+-    private static int namedBubbleValue(Object object) {
+-        for (String name : new String[]{"subBubbleId", "bubbleId", "bubble_id", "themeBubbleId",
+-                "aioBubbleId", "bubbleItemId"}) {
+-            int value = positiveInt(field(object, name));
+-            if (value > 0) return value;
+-        }
+-        return 0;
+-    }
+-
+-    private static int bubbleIdFromText(String value) {
+-        if (value == null || value.length() > 200_000) return 0;
+-        Matcher matcher = BUBBLE_ID_TEXT.matcher(value);
+-        return matcher.find() ? positiveInt(matcher.group(1)) : 0;
+-    }
+-
+-    private static int bubbleValue(Object bubble) {
+-        if (bubble == null) return 0;
+-        int sub = positiveInt(field(bubble, "subBubbleId"));
+-        return sub > 0 ? sub : positiveInt(field(bubble, "bubbleId"));
+-    }
+-
+-    static Object invokeNoArgs(Object object, String methodName) {
+-        if (object == null) return null;
+-        Class<?> type = object.getClass();
+-        while (type != null && type != Object.class) {
+-            try {
+-                Method method = type.getDeclaredMethod(methodName);
+-                method.setAccessible(true);
+-                return method.invoke(object);
+-            } catch (Throwable ignored) {
+-                type = type.getSuperclass();
+-            }
+-        }
+-        return null;
+-    }
+-
+-    static Field firstInstanceField(Class<?> type, Class<?> wanted) {
+-        Class<?> current = type;
+-        while (current != null && current != Object.class) {
+-            for (Field field : current.getDeclaredFields()) {
+-                if (!Modifier.isStatic(field.getModifiers()) && wanted.isAssignableFrom(field.getType())) {
+-                    field.setAccessible(true);
+-                    return field;
+-                }
+-            }
+-            current = current.getSuperclass();
+-        }
+-        return null;
+-    }
+-
+-    private static boolean isScalar(Object value) {
+-        return value instanceof String || value instanceof Number || value instanceof Boolean
+-                || value instanceof Character || value.getClass().isEnum() || value.getClass().isPrimitive();
+-    }
+-
+-    private static boolean hasField(Class<?> type, String name) {
+-        Class<?> current = type;
+-        while (current != null && current != Object.class) {
+-            try {
+-                current.getDeclaredField(name);
+-                return true;
+-            } catch (Throwable ignored) {
+-                current = current.getSuperclass();
+-            }
+-        }
+-        return false;
+-    }
+ }
+--- a/app/src/main/java/com/qiutian/bianpaobubble/hook/WeakIdentityMap.java
++++ b/app/src/main/java/com/qiutian/bianpaobubble/hook/WeakIdentityMap.java
+@@ -0,0 +1,35 @@
++package com.qiutian.bianpaobubble.hook;
++
++import java.lang.ref.ReferenceQueue;
++import java.lang.ref.WeakReference;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/** Weak keys compared by identity, even when QQ menu items override equals/hashCode. */
++final class WeakIdentityMap<V> {
++    private final ReferenceQueue<Object> queue = new ReferenceQueue<>();
++    private final Map<Key, V> entries = new LinkedHashMap<>();
++    private final int limit;
++    WeakIdentityMap(int limit) { this.limit = limit; }
++    synchronized void put(Object key, V value) {
++        clean();
++        entries.put(new Key(key, queue), value);
++        while (entries.size() > limit) entries.remove(entries.keySet().iterator().next());
++    }
++    synchronized V get(Object key) { clean(); return key == null ? null : entries.get(new Key(key, null)); }
++    synchronized boolean containsKey(Object key) { return get(key) != null; }
++    private void clean() {
++        Key dead;
++        while ((dead = (Key) queue.poll()) != null) entries.remove(dead);
++    }
++    private static final class Key extends WeakReference<Object> {
++        private final int hash;
++        Key(Object value, ReferenceQueue<Object> queue) { super(value, queue); hash = System.identityHashCode(value); }
++        @Override public int hashCode() { return hash; }
++        @Override public boolean equals(Object other) {
++            if (this == other) return true;
++            Object value = get();
++            return value != null && other instanceof Key && value == ((Key) other).get();
++        }
++    }
++}
