@@ -1,5 +1,7 @@
 # 3.7 构建与签名
 
+> 私人源码副本：应用内部的原签名限制已取消。无需原密钥的私人构建，请使用 `tools/build_private.py`，详见 [PRIVATE_BUILD.md](PRIVATE_BUILD.md)。本文下方的原发布构建通道仍保留原证书校验，用于需要覆盖升级原版的情况。
+
 ## 环境
 
 - JDK 17，含 `java`、`keytool`；Python 3.9+。
