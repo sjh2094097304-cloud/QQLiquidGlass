@@ -35,7 +35,6 @@ import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import de.robv.android.xposed.AndroidAppHelper;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
@@ -84,12 +83,6 @@ public final class BubbleXposedInit implements IXposedHookLoadPackage, IXposedHo
                 }
             });
         } catch (Throwable error) { HookLog.info("Application.attach 挂载失败：" + error.getClass().getSimpleName()); }
-        // Rootless/late-injection frameworks may invoke handleLoadPackage after attach.
-        try {
-            Application running = AndroidAppHelper.currentApplication();
-            if (running != null && QQ_PACKAGE.equals(running.getPackageName())) initialize(running, lpparam.classLoader);
-        } catch (Throwable error) { HookLog.info("延迟注入检查：" + error.getClass().getSimpleName()); }
-    }
 
     private static synchronized void initialize(Context context, ClassLoader fallbackLoader) {
         if (initialized || context == null) return;
