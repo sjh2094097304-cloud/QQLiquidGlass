@@ -1,0 +1,161 @@
+name: Build LiquidGlass APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: liquidglass-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: JDK 17 / Android 35
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      ANDROID_API: '35'
+      BUILD_TOOLS_VERSION: '35.0.0'
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS_VERSION}"
+
+          test -f "${ANDROID_HOME}/platforms/android-${ANDROID_API}/android.jar"
+          test -x "${ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}/aapt2"
+          test -f "${ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}/lib/d8.jar"
+          test -f "${ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}/lib/apksigner.jar"
+          test -f "vendor/libxposed-api-102/classes.jar"
+
+      - name: Run regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x build.sh setup-tools.sh tests/run.sh tests/runtime.sh
+          bash tests/run.sh
+
+      # 推荐把源码包中的 debug.keystore 转成 Base64 后保存为 GitHub Secret，
+      # 这样每次 Actions 构建都保持和现有 APK 相同的签名。
+      # Secrets:
+      #   SIGNING_KEYSTORE_BASE64 = debug.keystore 的 Base64
+      #   KEYSTORE_PASSWORD        = android
+      #   KEY_ALIAS                = androiddebugkey
+      #   KEY_PASSWORD             = android
+      - name: Restore signing key from GitHub Secrets
+        if: ${{ github.event_name != 'pull_request' }}
+        shell: bash
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SECRET_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SECRET_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${SIGNING_KEYSTORE_BASE64:-}" ]]; then
+            KS="${RUNNER_TEMP}/liquidglass-signing.keystore"
+            printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 --decode > "$KS"
+            chmod 600 "$KS"
+
+            if [[ -z "${SECRET_KEYSTORE_PASSWORD:-}" ]]; then
+              echo '::error::SIGNING_KEYSTORE_BASE64 已设置，但 KEYSTORE_PASSWORD 为空。'
+              exit 1
+            fi
+
+            echo "KEYSTORE=$KS" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASS=${SECRET_KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+            echo "KEY_PASS=${SECRET_KEY_PASSWORD:-$SECRET_KEYSTORE_PASSWORD}" >> "$GITHUB_ENV"
+
+            if [[ -n "${SECRET_KEY_ALIAS:-}" ]]; then
+              echo "KEY_ALIAS=${SECRET_KEY_ALIAS}" >> "$GITHUB_ENV"
+            fi
+
+            echo 'Signing key restored from GitHub Secrets.'
+          elif [[ -f debug.keystore ]]; then
+            echo 'No signing Secret configured; build.sh will use repository debug.keystore.'
+          else
+            echo '::warning::没有配置固定签名。build.sh 会临时生成 debug.keystore；不同构建之间签名可能不一致，不能直接覆盖安装更新。'
+          fi
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_PLATFORM_JAR="${ANDROID_HOME}/platforms/android-${ANDROID_API}/android.jar"
+          export ANDROID_BUILD_TOOLS="${ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}"
+          export LIBXPOSED_API_JAR="${GITHUB_WORKSPACE}/vendor/libxposed-api-102/classes.jar"
+          bash build.sh
+
+          APK="$(find . -maxdepth 1 -type f -name 'LiquidGlass-v*.apk' -print -quit)"
+          test -n "$APK"
+
+          VERSION="$(sed -n 's/.*android:versionName="\([^"]*\)".*/\1/p' AndroidManifest.xml)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APK_PATH=${APK#./}" >> "$GITHUB_ENV"
+
+          echo "Built: $APK"
+          sha256sum "$APK"
+
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -cp "${ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}/lib/apksigner.jar" \
+            com.android.apksigner.ApkSignerTool verify \
+            --verbose --print-certs "$APK_PATH"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiquidGlass-APK-${{ github.run_number }}
+          path: |
+            LiquidGlass-v*.apk
+            BUILD-VERIFICATION.md
+            CHANGELOG-QQDOCK6.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release for v* tag
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_PATH" --clobber
+          else
+            gh release create "$TAG" "$APK_PATH" \
+              --title "$TAG" \
+              --generate-notes
+          fi
